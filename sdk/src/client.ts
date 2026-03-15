@@ -7,6 +7,7 @@ export class Lux {
   private socket: Socket | null = null;
   private host: string;
   private port: number;
+  private password?: string;
   private connected = false;
   private chunks: Buffer[] = [];
   private buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
@@ -16,12 +17,13 @@ export class Lux {
   constructor(config: LuxConfig) {
     this.host = config.host;
     this.port = config.port || 6379;
+    this.password = config.password;
   }
 
   async connect(): Promise<void> {
     if (this.connected) return;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.socket = new Socket();
 
       this.socket.on("connect", () => {
@@ -50,10 +52,14 @@ export class Lux {
       this.socket.setNoDelay(true);
       this.socket.connect(this.port, this.host);
     });
+
+    if (this.password) {
+      await this.command("AUTH", this.password);
+    }
   }
 
   createSubscriber(): LuxSubscriber {
-    return new LuxSubscriber({ host: this.host, port: this.port });
+    return new LuxSubscriber({ host: this.host, port: this.port, password: this.password });
   }
 
   disconnect(): void {

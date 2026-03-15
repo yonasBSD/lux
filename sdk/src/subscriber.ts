@@ -6,6 +6,7 @@ export class LuxSubscriber {
   private socket: Socket | null = null;
   private host: string;
   private port: number;
+  private password?: string;
   private connected = false;
   private buffer = "";
   private listeners = new Map<string, Set<(channel: string, message: string) => void>>();
@@ -13,12 +14,13 @@ export class LuxSubscriber {
   constructor(config: LuxConfig) {
     this.host = config.host;
     this.port = config.port || 6379;
+    this.password = config.password;
   }
 
   async connect(): Promise<void> {
     if (this.connected) return;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.socket = new Socket();
 
       this.socket.on("connect", () => {
@@ -44,6 +46,22 @@ export class LuxSubscriber {
       this.socket.setNoDelay(true);
       this.socket.connect(this.port, this.host);
     });
+
+    if (this.password && this.socket) {
+      const cmd = `*2\r\n$4\r\nAUTH\r\n$${Buffer.byteLength(this.password)}\r\n${this.password}\r\n`;
+      this.socket.write(cmd);
+      await new Promise<void>((resolve) => {
+        const handler = (data: Buffer) => {
+          const resp = data.toString();
+          if (resp.startsWith("+OK") || resp.startsWith("-")) {
+            this.socket?.removeListener("data", handler);
+            if (resp.startsWith("-")) throw new LuxConnectionError("AUTH failed");
+            resolve();
+          }
+        };
+        this.socket!.on("data", handler);
+      });
+    }
   }
 
   disconnect(): void {
