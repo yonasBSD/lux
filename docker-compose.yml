@@ -1,0 +1,20 @@
+services:
+  lux:
+    build: .
+    container_name: lux
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    environment:
+      - LUX_PORT=6379
+      - LUX_DATA_DIR=/data
+      # - LUX_PASSWORD=changeme
+      # - LUX_SHARDS=16
+      # - LUX_SAVE_INTERVAL=300
+      # - LUX_RESTRICTED=false
+    volumes:
+      - lux-data:/data
+    command: ["/lux"]
+
+volumes:
+  lux-data:
