@@ -97,6 +97,14 @@ OK
 docker run -d -p 6379:6379 ghcr.io/lux-db/lux:latest
 ```
 
+### Docker Compose
+
+```bash
+docker compose up -d        # start
+docker compose up -d --build  # rebuild & start
+docker compose down         # stop
+```
+
 ### Environment Variables
 
 | Variable | Default | Description |
