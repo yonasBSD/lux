@@ -447,6 +447,7 @@ pub fn execute(
             let count = parse_u64(args[2]).unwrap_or(1) as usize;
             let idx = store.shard_for_key(args[1]);
             let mut shard = store.lock_write_shard(idx);
+            shard.version += 1;
             let ks = arg_str(args[1]);
             match shard.data.get_mut(ks) {
                 Some(entry) if !entry.is_expired_at(now) => {
@@ -480,6 +481,7 @@ pub fn execute(
             let count = parse_u64(args[2]).unwrap_or(1) as usize;
             let idx = store.shard_for_key(args[1]);
             let mut shard = store.lock_write_shard(idx);
+            shard.version += 1;
             let ks = arg_str(args[1]);
             match shard.data.get_mut(ks) {
                 Some(entry) if !entry.is_expired_at(now) => {
@@ -1411,6 +1413,7 @@ pub fn execute(
             format!("{}", new_val)
         };
         let expires_at = shard.data.get(ks).and_then(|e| e.expires_at);
+        shard.version += 1;
         shard.data.insert(
             ks.to_string(),
             Entry {
@@ -1495,11 +1498,6 @@ pub fn execute(
         || cmd_eq(cmd, b"RESET")
         || cmd_eq(cmd, b"LATENCY")
         || cmd_eq(cmd, b"SWAPDB")
-        || cmd_eq(cmd, b"MULTI")
-        || cmd_eq(cmd, b"EXEC")
-        || cmd_eq(cmd, b"DISCARD")
-        || cmd_eq(cmd, b"WATCH")
-        || cmd_eq(cmd, b"UNWATCH")
     {
         resp::write_ok(out);
     } else if cmd_eq(cmd, b"OBJECT") {
@@ -2275,6 +2273,121 @@ pub fn execute(
         resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
     }
     CmdResult::Written
+}
+
+pub fn is_known_command(cmd: &[u8]) -> bool {
+    cmd_eq(cmd, b"SET") || cmd_eq(cmd, b"GET") || cmd_eq(cmd, b"DEL")
+        || cmd_eq(cmd, b"PING") || cmd_eq(cmd, b"ECHO") || cmd_eq(cmd, b"QUIT")
+        || cmd_eq(cmd, b"SETNX") || cmd_eq(cmd, b"SETEX") || cmd_eq(cmd, b"PSETEX")
+        || cmd_eq(cmd, b"GETSET") || cmd_eq(cmd, b"MGET") || cmd_eq(cmd, b"MSET")
+        || cmd_eq(cmd, b"STRLEN") || cmd_eq(cmd, b"EXISTS") || cmd_eq(cmd, b"INCR")
+        || cmd_eq(cmd, b"DECR") || cmd_eq(cmd, b"INCRBY") || cmd_eq(cmd, b"DECRBY")
+        || cmd_eq(cmd, b"APPEND") || cmd_eq(cmd, b"KEYS") || cmd_eq(cmd, b"SCAN")
+        || cmd_eq(cmd, b"TTL") || cmd_eq(cmd, b"PTTL") || cmd_eq(cmd, b"EXPIRE")
+        || cmd_eq(cmd, b"PEXPIRE") || cmd_eq(cmd, b"PERSIST") || cmd_eq(cmd, b"TYPE")
+        || cmd_eq(cmd, b"RENAME") || cmd_eq(cmd, b"DBSIZE") || cmd_eq(cmd, b"FLUSHDB")
+        || cmd_eq(cmd, b"FLUSHALL") || cmd_eq(cmd, b"LPUSH") || cmd_eq(cmd, b"RPUSH")
+        || cmd_eq(cmd, b"LPOP") || cmd_eq(cmd, b"RPOP") || cmd_eq(cmd, b"LLEN")
+        || cmd_eq(cmd, b"LRANGE") || cmd_eq(cmd, b"LINDEX") || cmd_eq(cmd, b"HSET")
+        || cmd_eq(cmd, b"HMSET") || cmd_eq(cmd, b"HGET") || cmd_eq(cmd, b"HMGET")
+        || cmd_eq(cmd, b"HDEL") || cmd_eq(cmd, b"HGETALL") || cmd_eq(cmd, b"HKEYS")
+        || cmd_eq(cmd, b"HVALS") || cmd_eq(cmd, b"HLEN") || cmd_eq(cmd, b"HEXISTS")
+        || cmd_eq(cmd, b"HINCRBY") || cmd_eq(cmd, b"SADD") || cmd_eq(cmd, b"SREM")
+        || cmd_eq(cmd, b"SMEMBERS") || cmd_eq(cmd, b"SISMEMBER") || cmd_eq(cmd, b"SCARD")
+        || cmd_eq(cmd, b"SUNION") || cmd_eq(cmd, b"SINTER") || cmd_eq(cmd, b"SDIFF")
+        || cmd_eq(cmd, b"SAVE") || cmd_eq(cmd, b"INFO") || cmd_eq(cmd, b"CONFIG")
+        || cmd_eq(cmd, b"CLIENT") || cmd_eq(cmd, b"SELECT") || cmd_eq(cmd, b"COMMAND")
+        || cmd_eq(cmd, b"GETDEL") || cmd_eq(cmd, b"GETEX") || cmd_eq(cmd, b"GETRANGE")
+        || cmd_eq(cmd, b"SUBSTR") || cmd_eq(cmd, b"SETRANGE") || cmd_eq(cmd, b"MSETNX")
+        || cmd_eq(cmd, b"UNLINK") || cmd_eq(cmd, b"EXPIREAT") || cmd_eq(cmd, b"PEXPIREAT")
+        || cmd_eq(cmd, b"EXPIRETIME") || cmd_eq(cmd, b"PEXPIRETIME")
+        || cmd_eq(cmd, b"LSET") || cmd_eq(cmd, b"LINSERT") || cmd_eq(cmd, b"LREM")
+        || cmd_eq(cmd, b"LTRIM") || cmd_eq(cmd, b"LPUSHX") || cmd_eq(cmd, b"RPUSHX")
+        || cmd_eq(cmd, b"LPOS") || cmd_eq(cmd, b"LMOVE") || cmd_eq(cmd, b"RPOPLPUSH")
+        || cmd_eq(cmd, b"HSETNX") || cmd_eq(cmd, b"HINCRBYFLOAT") || cmd_eq(cmd, b"HSTRLEN")
+        || cmd_eq(cmd, b"SPOP") || cmd_eq(cmd, b"SRANDMEMBER") || cmd_eq(cmd, b"SMOVE")
+        || cmd_eq(cmd, b"SMISMEMBER") || cmd_eq(cmd, b"SDIFFSTORE")
+        || cmd_eq(cmd, b"SINTERSTORE") || cmd_eq(cmd, b"SUNIONSTORE")
+        || cmd_eq(cmd, b"SINTERCARD") || cmd_eq(cmd, b"HRANDFIELD")
+        || cmd_eq(cmd, b"HSCAN") || cmd_eq(cmd, b"SSCAN") || cmd_eq(cmd, b"INCRBYFLOAT")
+        || cmd_eq(cmd, b"TIME") || cmd_eq(cmd, b"RENAMENX") || cmd_eq(cmd, b"RANDOMKEY")
+        || cmd_eq(cmd, b"HELLO") || cmd_eq(cmd, b"PSUBSCRIBE") || cmd_eq(cmd, b"PUNSUBSCRIBE")
+        || cmd_eq(cmd, b"COPY") || cmd_eq(cmd, b"FUNCTION") || cmd_eq(cmd, b"DEBUG")
+        || cmd_eq(cmd, b"WAIT") || cmd_eq(cmd, b"RESET") || cmd_eq(cmd, b"LATENCY")
+        || cmd_eq(cmd, b"SWAPDB") || cmd_eq(cmd, b"OBJECT") || cmd_eq(cmd, b"MEMORY")
+        || cmd_eq(cmd, b"BGSAVE") || cmd_eq(cmd, b"LASTSAVE") || cmd_eq(cmd, b"PUBLISH")
+        || cmd_eq(cmd, b"SUBSCRIBE") || cmd_eq(cmd, b"ZADD") || cmd_eq(cmd, b"ZSCORE")
+        || cmd_eq(cmd, b"ZRANK") || cmd_eq(cmd, b"ZREVRANK") || cmd_eq(cmd, b"ZREM")
+        || cmd_eq(cmd, b"ZCARD") || cmd_eq(cmd, b"ZRANGE") || cmd_eq(cmd, b"ZINCRBY")
+        || cmd_eq(cmd, b"ZCOUNT") || cmd_eq(cmd, b"ZPOPMIN") || cmd_eq(cmd, b"ZPOPMAX")
+        || cmd_eq(cmd, b"ZUNIONSTORE") || cmd_eq(cmd, b"ZINTERSTORE")
+        || cmd_eq(cmd, b"ZDIFFSTORE") || cmd_eq(cmd, b"ZSCAN") || cmd_eq(cmd, b"ZMSCORE")
+        || cmd_eq(cmd, b"ZLEXCOUNT") || cmd_eq(cmd, b"ZRANGEBYSCORE")
+        || cmd_eq(cmd, b"ZREVRANGEBYSCORE") || cmd_eq(cmd, b"ZRANGEBYLEX")
+        || cmd_eq(cmd, b"ZREVRANGEBYLEX") || cmd_eq(cmd, b"ZREMRANGEBYRANK")
+        || cmd_eq(cmd, b"ZREMRANGEBYSCORE") || cmd_eq(cmd, b"ZREMRANGEBYLEX")
+        || cmd_eq(cmd, b"AUTH")
+}
+
+pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("ERR no command".to_string());
+    }
+    let cmd = args[0];
+    let min = if cmd_eq(cmd, b"SET") || cmd_eq(cmd, b"GETSET") || cmd_eq(cmd, b"SETNX")
+        || cmd_eq(cmd, b"APPEND") || cmd_eq(cmd, b"EXPIRE") || cmd_eq(cmd, b"PEXPIRE")
+        || cmd_eq(cmd, b"HGET") || cmd_eq(cmd, b"HEXISTS") || cmd_eq(cmd, b"SISMEMBER")
+        || cmd_eq(cmd, b"LINDEX") || cmd_eq(cmd, b"GETRANGE") || cmd_eq(cmd, b"SUBSTR")
+    {
+        3
+    } else if cmd_eq(cmd, b"GET") || cmd_eq(cmd, b"DEL") || cmd_eq(cmd, b"EXISTS")
+        || cmd_eq(cmd, b"INCR") || cmd_eq(cmd, b"DECR") || cmd_eq(cmd, b"STRLEN")
+        || cmd_eq(cmd, b"TTL") || cmd_eq(cmd, b"PTTL") || cmd_eq(cmd, b"TYPE")
+        || cmd_eq(cmd, b"PERSIST") || cmd_eq(cmd, b"KEYS") || cmd_eq(cmd, b"LLEN")
+        || cmd_eq(cmd, b"LPOP") || cmd_eq(cmd, b"RPOP") || cmd_eq(cmd, b"HGETALL")
+        || cmd_eq(cmd, b"HKEYS") || cmd_eq(cmd, b"HVALS") || cmd_eq(cmd, b"HLEN")
+        || cmd_eq(cmd, b"SMEMBERS") || cmd_eq(cmd, b"SCARD") || cmd_eq(cmd, b"ZCARD")
+        || cmd_eq(cmd, b"SCAN") || cmd_eq(cmd, b"ECHO") || cmd_eq(cmd, b"GETDEL")
+        || cmd_eq(cmd, b"GETEX")
+    {
+        2
+    } else if cmd_eq(cmd, b"LPUSH") || cmd_eq(cmd, b"RPUSH") || cmd_eq(cmd, b"SADD")
+        || cmd_eq(cmd, b"SREM") || cmd_eq(cmd, b"INCRBY") || cmd_eq(cmd, b"DECRBY")
+        || cmd_eq(cmd, b"MSET") || cmd_eq(cmd, b"MGET") || cmd_eq(cmd, b"RENAME")
+        || cmd_eq(cmd, b"INCRBYFLOAT") || cmd_eq(cmd, b"HDEL") || cmd_eq(cmd, b"HMGET")
+        || cmd_eq(cmd, b"COPY") || cmd_eq(cmd, b"LRANGE") || cmd_eq(cmd, b"SUNION")
+        || cmd_eq(cmd, b"SINTER") || cmd_eq(cmd, b"SDIFF")
+    {
+        3
+    } else if cmd_eq(cmd, b"SETEX") || cmd_eq(cmd, b"PSETEX") || cmd_eq(cmd, b"HSET")
+        || cmd_eq(cmd, b"HMSET") || cmd_eq(cmd, b"HINCRBY") || cmd_eq(cmd, b"HSETNX")
+        || cmd_eq(cmd, b"HINCRBYFLOAT") || cmd_eq(cmd, b"ZADD") || cmd_eq(cmd, b"LSET")
+        || cmd_eq(cmd, b"SETRANGE") || cmd_eq(cmd, b"LINSERT") || cmd_eq(cmd, b"LREM")
+        || cmd_eq(cmd, b"LTRIM") || cmd_eq(cmd, b"ZUNIONSTORE") || cmd_eq(cmd, b"ZINTERSTORE")
+        || cmd_eq(cmd, b"ZDIFFSTORE") || cmd_eq(cmd, b"ZSCORE") || cmd_eq(cmd, b"ZRANK")
+        || cmd_eq(cmd, b"ZREVRANK") || cmd_eq(cmd, b"ZREM") || cmd_eq(cmd, b"ZINCRBY")
+        || cmd_eq(cmd, b"SMOVE") || cmd_eq(cmd, b"HSTRLEN")
+    {
+        4
+    } else if cmd_eq(cmd, b"PING") || cmd_eq(cmd, b"DBSIZE") || cmd_eq(cmd, b"FLUSHDB")
+        || cmd_eq(cmd, b"FLUSHALL") || cmd_eq(cmd, b"SAVE") || cmd_eq(cmd, b"INFO")
+        || cmd_eq(cmd, b"TIME") || cmd_eq(cmd, b"RANDOMKEY") || cmd_eq(cmd, b"BGSAVE")
+        || cmd_eq(cmd, b"LASTSAVE") || cmd_eq(cmd, b"HELLO") || cmd_eq(cmd, b"QUIT")
+        || cmd_eq(cmd, b"COMMAND") || cmd_eq(cmd, b"CONFIG") || cmd_eq(cmd, b"CLIENT")
+        || cmd_eq(cmd, b"SELECT")
+    {
+        1
+    } else {
+        return Ok(());
+    };
+    if args.len() < min {
+        let cmd_name = std::str::from_utf8(cmd).unwrap_or("unknown").to_lowercase();
+        return Err(format!(
+            "ERR wrong number of arguments for '{}' command",
+            cmd_name
+        ));
+    }
+    Ok(())
 }
 
 fn format_float(v: f64) -> String {

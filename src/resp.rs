@@ -8,6 +8,8 @@ pub static ONE: &[u8] = b":1\r\n";
 pub static NEG_ONE: &[u8] = b":-1\r\n";
 pub static NEG_TWO: &[u8] = b":-2\r\n";
 pub static EMPTY_ARRAY: &[u8] = b"*0\r\n";
+pub static QUEUED: &[u8] = b"+QUEUED\r\n";
+pub static NULL_ARRAY: &[u8] = b"*-1\r\n";
 
 pub fn write_ok(buf: &mut BytesMut) {
     buf.extend_from_slice(OK);
@@ -19,6 +21,14 @@ pub fn write_pong(buf: &mut BytesMut) {
 
 pub fn write_null(buf: &mut BytesMut) {
     buf.extend_from_slice(NULL);
+}
+
+pub fn write_queued(buf: &mut BytesMut) {
+    buf.extend_from_slice(QUEUED);
+}
+
+pub fn write_null_array(buf: &mut BytesMut) {
+    buf.extend_from_slice(NULL_ARRAY);
 }
 
 pub fn write_simple(buf: &mut BytesMut, s: &str) {
