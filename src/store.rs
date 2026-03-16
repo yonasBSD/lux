@@ -2,7 +2,32 @@ use bytes::Bytes;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use std::collections::{HashSet, VecDeque};
+use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Default)]
+pub(crate) struct FxBuildHasher;
+
+impl BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher(0xcbf29ce484222325)
+    }
+}
+
+pub(crate) struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 pub fn num_shards() -> usize {
     static SHARDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -52,7 +77,7 @@ impl Entry {
 
 #[repr(align(128))]
 pub(crate) struct Shard {
-    pub(crate) data: HashMap<String, Entry>,
+    pub(crate) data: HashMap<String, Entry, FxBuildHasher>,
 }
 
 pub struct Store {
@@ -85,7 +110,7 @@ impl Store {
         let shards: Vec<RwLock<Shard>> = (0..n)
             .map(|_| {
                 RwLock::new(Shard {
-                    data: HashMap::new(),
+                    data: HashMap::with_hasher(FxBuildHasher),
                 })
             })
             .collect();
@@ -116,24 +141,22 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn get_from_shard(data: &HashMap<String, Entry>, key: &[u8], now: Instant) -> Option<Bytes> {
-        let hash = fx_hash(key);
-        data.raw_entry()
-            .from_hash(hash, |k| k.as_bytes() == key)
-            .and_then(|(_, entry)| {
-                if entry.is_expired_at(now) { return None; }
-                match &entry.value {
-                    StoreValue::Str(s) => Some(s.clone()),
-                    _ => None,
-                }
-            })
+    pub fn get_from_shard(data: &HashMap<String, Entry, FxBuildHasher>, key: &[u8], now: Instant) -> Option<Bytes> {
+        let ks = key_str(key);
+        data.get(ks).and_then(|entry| {
+            if entry.is_expired_at(now) { return None; }
+            match &entry.value {
+                StoreValue::Str(s) => Some(s.clone()),
+                _ => None,
+            }
+        })
     }
 
     #[inline(always)]
-    pub fn get_and_write(data: &HashMap<String, Entry>, key: &[u8], now: Instant, out: &mut bytes::BytesMut) {
-        let hash = fx_hash(key);
-        match data.raw_entry().from_hash(hash, |k| k.as_bytes() == key) {
-            Some((_, entry)) if !entry.is_expired_at(now) => {
+    pub fn get_and_write(data: &HashMap<String, Entry, FxBuildHasher>, key: &[u8], now: Instant, out: &mut bytes::BytesMut) {
+        let ks = key_str(key);
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => {
                 if let StoreValue::Str(s) = &entry.value {
                     crate::resp::write_bulk_raw(out, s);
                 } else {
@@ -145,21 +168,17 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn set_on_shard(data: &mut HashMap<String, Entry>, key: &[u8], value: &[u8], ttl: Option<Duration>, now: Instant) {
-        let hash = fx_hash(key);
+    pub fn set_on_shard(data: &mut HashMap<String, Entry, FxBuildHasher>, key: &[u8], value: &[u8], ttl: Option<Duration>, now: Instant) {
         let expires_at = ttl.map(|d| now + d);
-        match data.raw_entry_mut().from_hash(hash, |k| k.as_bytes() == key) {
-            hashbrown::hash_map::RawEntryMut::Occupied(mut e) => {
-                let entry = e.get_mut();
-                entry.value = StoreValue::Str(Bytes::copy_from_slice(value));
-                entry.expires_at = expires_at;
-            }
-            hashbrown::hash_map::RawEntryMut::Vacant(e) => {
-                e.insert_with_hasher(hash, key_string(key), Entry {
-                    value: StoreValue::Str(Bytes::copy_from_slice(value)),
-                    expires_at,
-                }, |k| fx_hash(k.as_bytes()));
-            }
+        let ks = key_string(key);
+        if let Some(entry) = data.get_mut(&ks) {
+            entry.value = StoreValue::Str(Bytes::copy_from_slice(value));
+            entry.expires_at = expires_at;
+        } else {
+            data.insert(ks, Entry {
+                value: StoreValue::Str(Bytes::copy_from_slice(value)),
+                expires_at,
+            });
         }
     }
 
