@@ -3424,6 +3424,162 @@ mod tests {
     }
 
     #[test]
+    fn expireat_sets_absolute_expiry() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"k", b"v", None, n);
+        let future_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        assert!(store.expireat(b"k", future_ts, n));
+        let ttl = store.ttl(b"k", n);
+        assert!(ttl > 3500 && ttl <= 3600, "TTL should be ~3600: {ttl}");
+    }
+
+    #[test]
+    fn expireat_past_timestamp_fails() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"k", b"v", None, n);
+        assert!(!store.expireat(b"k", 1000, n));
+    }
+
+    #[test]
+    fn pexpireat_sets_ms_expiry() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"k", b"v", None, n);
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60000;
+        assert!(store.pexpireat(b"k", future_ms, n));
+        let pttl = store.pttl(b"k", n);
+        assert!(pttl > 50000 && pttl <= 60000, "PTTL should be ~60000: {pttl}");
+    }
+
+    #[test]
+    fn expiretime_returns_unix_timestamp() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"k", b"v", Some(Duration::from_secs(3600)), n);
+        let et = store.expiretime(b"k", n);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            et > now_unix + 3500 && et <= now_unix + 3600,
+            "expiretime should be ~now+3600: {et}"
+        );
+    }
+
+    #[test]
+    fn expiretime_no_ttl_returns_neg1() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"k", b"v", None, n);
+        assert_eq!(store.expiretime(b"k", n), -1);
+    }
+
+    #[test]
+    fn expiretime_missing_key_returns_neg2() {
+        let store = Store::new();
+        assert_eq!(store.expiretime(b"nope", now()), -2);
+    }
+
+    #[test]
+    fn pexpiretime_returns_unix_ms() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"k", b"v", Some(Duration::from_secs(100)), n);
+        let pet = store.pexpiretime(b"k", n);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(
+            pet > now_ms + 90000 && pet <= now_ms + 100000,
+            "pexpiretime should be ~now+100s in ms: {pet}"
+        );
+    }
+
+    #[test]
+    fn unlink_same_as_del() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"a", b"1", None, n);
+        store.set(b"b", b"2", None, n);
+        assert_eq!(store.unlink(&[b"a", b"b", b"c"]), 2);
+        assert!(store.get(b"a", n).is_none());
+        assert!(store.get(b"b", n).is_none());
+    }
+
+    #[test]
+    fn spop_removes_members() {
+        let store = Store::new();
+        let n = now();
+        store.sadd(b"s", &[b"a", b"b", b"c"], n).unwrap();
+        let popped = store.spop(b"s", 2, n).unwrap();
+        assert_eq!(popped.len(), 2);
+        assert_eq!(store.scard(b"s", n).unwrap(), 1);
+    }
+
+    #[test]
+    fn spop_more_than_available() {
+        let store = Store::new();
+        let n = now();
+        store.sadd(b"s", &[b"a", b"b"], n).unwrap();
+        let popped = store.spop(b"s", 10, n).unwrap();
+        assert_eq!(popped.len(), 2);
+        assert_eq!(store.scard(b"s", n).unwrap(), 0);
+    }
+
+    #[test]
+    fn shard_version_bumps_on_mutation() {
+        let store = Store::new();
+        let n = now();
+        let idx = store.shard_for_key(b"testkey");
+        let v0 = store.shard_version(idx);
+        store.set(b"testkey", b"val", None, n);
+        let v1 = store.shard_version(idx);
+        assert!(v1 > v0, "version should increase after set: {v0} -> {v1}");
+        store.del(&[b"testkey"]);
+        let v2 = store.shard_version(idx);
+        assert!(v2 > v1, "version should increase after del: {v1} -> {v2}");
+    }
+
+    #[test]
+    fn shard_version_stable_on_reads() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"k", b"v", None, n);
+        let idx = store.shard_for_key(b"k");
+        let v0 = store.shard_version(idx);
+        store.get(b"k", n);
+        store.strlen(b"k", n);
+        store.exists(&[b"k"], n);
+        store.ttl(b"k", n);
+        let v1 = store.shard_version(idx);
+        assert_eq!(v0, v1, "reads should not bump version");
+    }
+
+    #[test]
+    fn lset_bumps_version() {
+        let store = Store::new();
+        let n = now();
+        store.rpush(b"list", &[b"a", b"b"], n).unwrap();
+        let idx = store.shard_for_key(b"list");
+        let v0 = store.shard_version(idx);
+        store.lset(b"list", 0, b"x", n).unwrap();
+        let v1 = store.shard_version(idx);
+        assert!(v1 > v0, "lset bumps version");
+    }
+
+    #[test]
     fn glob_matcher_patterns() {
         let m = GlobMatcher::new("user:*");
         assert!(m.matches("user:123"));

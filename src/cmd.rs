@@ -2634,4 +2634,426 @@ mod tests {
         assert!(exec_str(&store, &[b"TYPE", b"zs"]).contains("zset"));
         assert!(exec_str(&store, &[b"TYPE", b"missing"]).contains("none"));
     }
+
+    #[test]
+    fn exec_without_multi_returns_error() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"EXEC"]);
+        assert!(out.contains("ERR unknown command"));
+    }
+
+    #[test]
+    fn discard_without_multi_returns_error() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"DISCARD"]);
+        assert!(out.contains("ERR unknown command"));
+    }
+
+    #[test]
+    fn validate_args_rejects_missing_args() {
+        assert!(validate_args(&[b"SET" as &[u8], b"key"]).is_err());
+        assert!(validate_args(&[b"GET" as &[u8]]).is_err());
+        assert!(validate_args(&[b"HSET" as &[u8], b"k", b"f"]).is_err());
+    }
+
+    #[test]
+    fn validate_args_accepts_valid_commands() {
+        assert!(validate_args(&[b"SET" as &[u8], b"key", b"val"]).is_ok());
+        assert!(validate_args(&[b"GET" as &[u8], b"key"]).is_ok());
+        assert!(validate_args(&[b"PING" as &[u8]]).is_ok());
+        assert!(validate_args(&[b"DEL" as &[u8], b"key"]).is_ok());
+    }
+
+    #[test]
+    fn validate_args_passes_unknown_commands() {
+        assert!(validate_args(&[b"FOOBAR" as &[u8]]).is_ok());
+    }
+
+    #[test]
+    fn set_xx_only_if_exists() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"SET", b"k", b"v", b"XX"]);
+        assert!(out.contains("$-1"), "XX on missing key returns null: {out}");
+        exec(&store, &[b"SET", b"k", b"orig"]);
+        let out = exec_str(&store, &[b"SET", b"k", b"new", b"XX"]);
+        assert!(out.contains("+OK"), "XX on existing key succeeds: {out}");
+        let out = exec_str(&store, &[b"GET", b"k"]);
+        assert!(out.contains("new"));
+    }
+
+    #[test]
+    fn set_px_millisecond_ttl() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"k", b"v", b"PX", b"100000"]);
+        let ttl = store.pttl(b"k", Instant::now());
+        assert!(ttl > 0 && ttl <= 100000, "PX TTL: {ttl}");
+    }
+
+    #[test]
+    fn psetex_sets_with_ms_ttl() {
+        let store = Store::new();
+        exec(&store, &[b"PSETEX", b"k", b"50000", b"val"]);
+        let out = exec_str(&store, &[b"GET", b"k"]);
+        assert!(out.contains("val"));
+        let ttl = store.pttl(b"k", Instant::now());
+        assert!(ttl > 0 && ttl <= 50000, "PSETEX TTL: {ttl}");
+    }
+
+    #[test]
+    fn copy_basic_and_replace() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"src", b"hello"]);
+        let out = exec_str(&store, &[b"COPY", b"src", b"dst"]);
+        assert!(out.contains(":1"));
+        let out = exec_str(&store, &[b"GET", b"dst"]);
+        assert!(out.contains("hello"));
+
+        exec(&store, &[b"SET", b"dst", b"existing"]);
+        let out = exec_str(&store, &[b"COPY", b"src", b"dst"]);
+        assert!(out.contains(":0"), "no REPLACE, dest exists: {out}");
+
+        let out = exec_str(&store, &[b"COPY", b"src", b"dst", b"REPLACE"]);
+        assert!(out.contains(":1"), "with REPLACE: {out}");
+        let out = exec_str(&store, &[b"GET", b"dst"]);
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn copy_nonexistent_source() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"COPY", b"nosrc", b"dst"]);
+        assert!(out.contains(":0"));
+    }
+
+    #[test]
+    fn renamenx_only_if_dest_missing() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"a", b"1"]);
+        exec(&store, &[b"SET", b"b", b"2"]);
+        let out = exec_str(&store, &[b"RENAMENX", b"a", b"b"]);
+        assert!(out.contains(":0"), "dest exists: {out}");
+        let out = exec_str(&store, &[b"RENAMENX", b"a", b"c"]);
+        assert!(out.contains(":1"), "dest missing: {out}");
+        let out = exec_str(&store, &[b"GET", b"c"]);
+        assert!(out.contains("1"));
+    }
+
+    #[test]
+    fn time_returns_two_element_array() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"TIME"]);
+        assert!(out.starts_with("*2\r\n"), "TIME array: {out}");
+    }
+
+    #[test]
+    fn object_encoding_types() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"num", b"42"]);
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"num"]);
+        assert!(out.contains("int"), "integer encoding: {out}");
+
+        exec(&store, &[b"SET", b"str", b"hello"]);
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"str"]);
+        assert!(out.contains("embstr"), "short string encoding: {out}");
+
+        exec(&store, &[b"LPUSH", b"list", b"a"]);
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"list"]);
+        assert!(out.contains("listpack"), "list encoding: {out}");
+    }
+
+    #[test]
+    fn object_encoding_missing_key() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"nope"]);
+        assert!(out.contains("ERR no such key"));
+    }
+
+    #[test]
+    fn memory_usage_returns_integer() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"k", b"hello"]);
+        let out = exec_str(&store, &[b"MEMORY", b"USAGE", b"k"]);
+        assert!(out.starts_with(":"), "should be integer: {out}");
+        let n: i64 = out.trim().trim_start_matches(':').trim_end_matches("\r\n").parse().unwrap_or(0);
+        assert!(n > 0, "should be positive: {n}");
+    }
+
+    #[test]
+    fn memory_usage_missing_key() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"MEMORY", b"USAGE", b"nope"]);
+        assert!(out.contains("$-1"), "null for missing key: {out}");
+    }
+
+    #[test]
+    fn lpos_basic() {
+        let store = Store::new();
+        exec(&store, &[b"RPUSH", b"list", b"a", b"b", b"c", b"b", b"d"]);
+        let out = exec_str(&store, &[b"LPOS", b"list", b"b"]);
+        assert!(out.contains(":1"), "first occurrence at index 1: {out}");
+    }
+
+    #[test]
+    fn lpos_count() {
+        let store = Store::new();
+        exec(&store, &[b"RPUSH", b"list", b"a", b"b", b"c", b"b", b"d"]);
+        let out = exec_str(&store, &[b"LPOS", b"list", b"b", b"COUNT", b"0"]);
+        assert!(out.contains("*2"), "two occurrences: {out}");
+        assert!(out.contains(":1"));
+        assert!(out.contains(":3"));
+    }
+
+    #[test]
+    fn lpos_rank_negative() {
+        let store = Store::new();
+        exec(&store, &[b"RPUSH", b"list", b"a", b"b", b"c", b"b", b"d"]);
+        let out = exec_str(&store, &[b"LPOS", b"list", b"b", b"RANK", b"-1"]);
+        assert!(out.contains(":3"), "last occurrence from end: {out}");
+    }
+
+    #[test]
+    fn lpos_not_found() {
+        let store = Store::new();
+        exec(&store, &[b"RPUSH", b"list", b"a", b"b"]);
+        let out = exec_str(&store, &[b"LPOS", b"list", b"z"]);
+        assert!(out.contains("$-1"), "not found returns null: {out}");
+    }
+
+    #[test]
+    fn hincrbyfloat_basic() {
+        let store = Store::new();
+        exec(&store, &[b"HSET", b"h", b"f", b"10.5"]);
+        let out = exec_str(&store, &[b"HINCRBYFLOAT", b"h", b"f", b"0.1"]);
+        assert!(out.contains("10.6"), "float increment: {out}");
+    }
+
+    #[test]
+    fn hincrbyfloat_creates_field() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"HINCRBYFLOAT", b"h", b"newf", b"3.14"]);
+        assert!(out.contains("3.14"), "creates field: {out}");
+    }
+
+    #[test]
+    fn hstrlen_returns_length() {
+        let store = Store::new();
+        exec(&store, &[b"HSET", b"h", b"f", b"hello"]);
+        let out = exec_str(&store, &[b"HSTRLEN", b"h", b"f"]);
+        assert!(out.contains(":5"), "length of 'hello': {out}");
+        let out = exec_str(&store, &[b"HSTRLEN", b"h", b"missing"]);
+        assert!(out.contains(":0"), "missing field: {out}");
+    }
+
+    #[test]
+    fn hscan_basic() {
+        let store = Store::new();
+        exec(&store, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]);
+        let out = exec_str(&store, &[b"HSCAN", b"h", b"0"]);
+        assert!(out.contains("f1"), "contains field: {out}");
+        assert!(out.contains("v1"), "contains value: {out}");
+    }
+
+    #[test]
+    fn sscan_basic() {
+        let store = Store::new();
+        exec(&store, &[b"SADD", b"s", b"a", b"b", b"c"]);
+        let out = exec_str(&store, &[b"SSCAN", b"s", b"0"]);
+        assert!(out.starts_with("*2"), "two-element array (cursor + items): {out}");
+    }
+
+    #[test]
+    fn zscan_basic() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"z", b"1", b"a", b"2", b"b"]);
+        let out = exec_str(&store, &[b"ZSCAN", b"z", b"0"]);
+        assert!(out.starts_with("*2"), "two-element array: {out}");
+        assert!(out.contains("a"));
+    }
+
+    #[test]
+    fn spop_single_and_count() {
+        let store = Store::new();
+        exec(&store, &[b"SADD", b"s", b"a", b"b", b"c"]);
+        let out = exec_str(&store, &[b"SPOP", b"s"]);
+        assert!(out.contains("$1"), "single element: {out}");
+
+        let out = exec_str(&store, &[b"SPOP", b"s", b"10"]);
+        assert!(out.starts_with("*"), "array for count variant: {out}");
+    }
+
+    #[test]
+    fn srandmember_does_not_remove() {
+        let store = Store::new();
+        exec(&store, &[b"SADD", b"s", b"a", b"b", b"c"]);
+        exec_str(&store, &[b"SRANDMEMBER", b"s"]);
+        let out = exec_str(&store, &[b"SCARD", b"s"]);
+        assert!(out.contains(":3"), "no removal: {out}");
+    }
+
+    #[test]
+    fn srandmember_count() {
+        let store = Store::new();
+        exec(&store, &[b"SADD", b"s", b"a", b"b", b"c"]);
+        let out = exec_str(&store, &[b"SRANDMEMBER", b"s", b"2"]);
+        assert!(out.starts_with("*"), "array response: {out}");
+    }
+
+    #[test]
+    fn sintercard_basic() {
+        let store = Store::new();
+        exec(&store, &[b"SADD", b"s1", b"a", b"b", b"c"]);
+        exec(&store, &[b"SADD", b"s2", b"b", b"c", b"d"]);
+        let out = exec_str(&store, &[b"SINTERCARD", b"2", b"s1", b"s2"]);
+        assert!(out.contains(":2"), "intersection cardinality: {out}");
+    }
+
+    #[test]
+    fn hrandfield_basic() {
+        let store = Store::new();
+        exec(&store, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]);
+        let out = exec_str(&store, &[b"HRANDFIELD", b"h"]);
+        assert!(out.contains("f1") || out.contains("f2"), "returns a field: {out}");
+    }
+
+    #[test]
+    fn hrandfield_count_withvalues() {
+        let store = Store::new();
+        exec(&store, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]);
+        let out = exec_str(&store, &[b"HRANDFIELD", b"h", b"2", b"WITHVALUES"]);
+        assert!(out.starts_with("*4"), "2 fields * 2 = 4 elements: {out}");
+    }
+
+    #[test]
+    fn zremrangebyrank_basic() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        let out = exec_str(&store, &[b"ZREMRANGEBYRANK", b"z", b"0", b"1"]);
+        assert!(out.contains(":2"), "removed 2: {out}");
+        let out = exec_str(&store, &[b"ZCARD", b"z"]);
+        assert!(out.contains(":1"), "1 remaining: {out}");
+    }
+
+    #[test]
+    fn zremrangebyscore_basic() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        let out = exec_str(&store, &[b"ZREMRANGEBYSCORE", b"z", b"-inf", b"2"]);
+        assert!(out.contains(":2"), "removed 2: {out}");
+        let out = exec_str(&store, &[b"ZCARD", b"z"]);
+        assert!(out.contains(":1"), "1 remaining: {out}");
+    }
+
+    #[test]
+    fn zremrangebylex_basic() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d"]);
+        let out = exec_str(&store, &[b"ZREMRANGEBYLEX", b"z", b"[a", b"[c"]);
+        assert!(out.contains(":3"), "removed a,b,c: {out}");
+        let out = exec_str(&store, &[b"ZCARD", b"z"]);
+        assert!(out.contains(":1"), "d remaining: {out}");
+    }
+
+    #[test]
+    fn zlexcount_basic() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c"]);
+        let out = exec_str(&store, &[b"ZLEXCOUNT", b"z", b"-", b"+"]);
+        assert!(out.contains(":3"), "all members: {out}");
+        let out = exec_str(&store, &[b"ZLEXCOUNT", b"z", b"[a", b"[b"]);
+        assert!(out.contains(":2"), "a and b: {out}");
+    }
+
+    #[test]
+    fn zrevrange_basic() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        let out = exec_str(&store, &[b"ZRANGE", b"z", b"0", b"-1", b"REV"]);
+        let a_pos = out.find("a").unwrap_or(0);
+        let c_pos = out.find("c").unwrap_or(usize::MAX);
+        assert!(c_pos < a_pos, "c before a in reverse: {out}");
+    }
+
+    #[test]
+    fn zrevrangebyscore_basic() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        let out = exec_str(&store, &[b"ZREVRANGEBYSCORE", b"z", b"3", b"1"]);
+        assert!(out.contains("a") && out.contains("c"), "contains both: {out}");
+    }
+
+    #[test]
+    fn unlink_same_as_del() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"a", b"1"]);
+        exec(&store, &[b"SET", b"b", b"2"]);
+        let out = exec_str(&store, &[b"UNLINK", b"a", b"b"]);
+        assert!(out.contains(":2"), "removed 2: {out}");
+        assert!(store.get(b"a", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn randomkey_returns_key_or_null() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"RANDOMKEY"]);
+        assert!(out.contains("$-1"), "empty db returns null: {out}");
+
+        exec(&store, &[b"SET", b"mykey", b"val"]);
+        let out = exec_str(&store, &[b"RANDOMKEY"]);
+        assert!(out.contains("mykey"), "returns existing key: {out}");
+    }
+
+    #[test]
+    fn hello_returns_server_info() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"HELLO"]);
+        assert!(out.contains("lux"), "contains server name: {out}");
+        assert!(out.contains("proto"), "contains proto: {out}");
+    }
+
+    #[test]
+    fn info_returns_bulk_string() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"INFO"]);
+        assert!(out.contains("lux_version"), "contains version: {out}");
+        assert!(out.contains("connected_clients"), "contains clients: {out}");
+    }
+
+    #[test]
+    fn config_get_returns_empty_array() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"CONFIG", b"GET", b"maxmemory"]);
+        assert!(out.contains("*0"), "empty array: {out}");
+    }
+
+    #[test]
+    fn select_returns_ok() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"SELECT", b"0"]);
+        assert!(out.contains("+OK"));
+    }
+
+    #[test]
+    fn substr_alias_for_getrange() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"k", b"Hello World"]);
+        let out = exec_str(&store, &[b"SUBSTR", b"k", b"0", b"4"]);
+        assert!(out.contains("Hello"), "substr works like getrange: {out}");
+    }
+
+    #[test]
+    fn multi_exec_discard_watch_unwatch_not_handled_by_cmd() {
+        let store = Store::new();
+        for cmd in &[
+            vec![b"MULTI" as &[u8]],
+            vec![b"WATCH", b"key"],
+            vec![b"UNWATCH"],
+        ] {
+            let out = exec_str(&store, &cmd);
+            assert!(
+                out.contains("ERR unknown command"),
+                "cmd {:?} should be unknown: {out}",
+                std::str::from_utf8(cmd[0])
+            );
+        }
+    }
 }
