@@ -752,20 +752,53 @@ async fn handle_connection(
                         }
                     }
                 } else {
-                    const IS_SIMPLE_SET: u8 = 1;
-                    const IS_SIMPLE_GET: u8 = 2;
+                    const FL_NONE: u8 = 0;
+                    const FL_READ: u8 = 1;
+                    const FL_WRITE: u8 = 2;
 
                     let mut shards: Vec<u32> = Vec::with_capacity(cmd_count);
                     let mut flags: Vec<u8> = Vec::with_capacity(cmd_count);
                     for args in &commands {
                         shards.push(store.shard_for_key(args[1]) as u32);
-                        flags.push(if cmd_eq_fast(args[0], b"SET") && args.len() == 3 {
-                            IS_SIMPLE_SET
-                        } else if cmd_eq_fast(args[0], b"GET") && args.len() == 2 {
-                            IS_SIMPLE_GET
-                        } else {
-                            0
-                        });
+                        let cmd = args[0];
+                        flags.push(
+                            if cmd_eq_fast(cmd, b"GET")
+                                || cmd_eq_fast(cmd, b"STRLEN")
+                                || cmd_eq_fast(cmd, b"LLEN")
+                                || cmd_eq_fast(cmd, b"SCARD")
+                                || cmd_eq_fast(cmd, b"HGET")
+                                || cmd_eq_fast(cmd, b"HLEN")
+                                || cmd_eq_fast(cmd, b"ZCARD")
+                                || cmd_eq_fast(cmd, b"ZSCORE")
+                                || cmd_eq_fast(cmd, b"TTL")
+                                || cmd_eq_fast(cmd, b"PTTL")
+                                || cmd_eq_fast(cmd, b"TYPE")
+                            {
+                                FL_READ
+                            } else if cmd_eq_fast(cmd, b"SET")
+                                || cmd_eq_fast(cmd, b"INCR")
+                                || cmd_eq_fast(cmd, b"DECR")
+                                || cmd_eq_fast(cmd, b"INCRBY")
+                                || cmd_eq_fast(cmd, b"DECRBY")
+                                || cmd_eq_fast(cmd, b"LPUSH")
+                                || cmd_eq_fast(cmd, b"RPUSH")
+                                || cmd_eq_fast(cmd, b"LPOP")
+                                || cmd_eq_fast(cmd, b"RPOP")
+                                || cmd_eq_fast(cmd, b"SADD")
+                                || cmd_eq_fast(cmd, b"SREM")
+                                || cmd_eq_fast(cmd, b"SPOP")
+                                || cmd_eq_fast(cmd, b"HSET")
+                                || cmd_eq_fast(cmd, b"HDEL")
+                                || cmd_eq_fast(cmd, b"ZADD")
+                                || cmd_eq_fast(cmd, b"ZREM")
+                                || cmd_eq_fast(cmd, b"ZPOPMIN")
+                                || cmd_eq_fast(cmd, b"ZPOPMAX")
+                            {
+                                FL_WRITE
+                            } else {
+                                FL_NONE
+                            },
+                        );
                     }
 
                     let mut i = 0usize;
@@ -776,73 +809,38 @@ async fn handle_connection(
                             batch_end += 1;
                         }
 
-                        if batch_end == i + 1 {
-                            let f = flags[i];
-                            if f == IS_SIMPLE_SET {
+                        let batch_flags = &flags[i..batch_end];
+                        let all_classified = batch_flags.iter().all(|&f| f != FL_NONE);
+
+                        if all_classified {
+                            let has_writes = batch_flags.contains(&FL_WRITE);
+                            if has_writes {
                                 let mut shard = store.lock_write_shard(shard_idx as usize);
                                 shard.version += 1;
-                                Store::set_on_shard(
-                                    &mut shard.data,
-                                    commands[i][1],
-                                    commands[i][2],
-                                    None,
-                                    now,
-                                );
-                                write_buf.extend_from_slice(resp::OK);
-                            } else if f == IS_SIMPLE_GET {
-                                let shard = store.lock_read_shard(shard_idx as usize);
-                                Store::get_and_write(
-                                    &shard.data,
-                                    commands[i][1],
-                                    now,
-                                    &mut write_buf,
-                                );
+                                for args in &commands[i..batch_end] {
+                                    cmd::execute_on_shard(
+                                        &mut shard.data,
+                                        &store,
+                                        &broker,
+                                        args,
+                                        &mut write_buf,
+                                        now,
+                                    );
+                                }
                             } else {
-                                cmd::execute(&store, &broker, &commands[i], &mut write_buf, now);
+                                let shard = store.lock_read_shard(shard_idx as usize);
+                                for args in &commands[i..batch_end] {
+                                    cmd::execute_on_shard_read(
+                                        &shard.data,
+                                        args,
+                                        &mut write_buf,
+                                        now,
+                                    );
+                                }
                             }
                         } else {
-                            let all_simple = flags[i..batch_end].iter().all(|&f| f != 0);
-                            if all_simple {
-                                let has_writes = flags[i..batch_end].contains(&IS_SIMPLE_SET);
-                                if has_writes {
-                                    let mut shard = store.lock_write_shard(shard_idx as usize);
-                                    shard.version += 1;
-                                    for (&f, args) in
-                                        flags[i..batch_end].iter().zip(&commands[i..batch_end])
-                                    {
-                                        if f == IS_SIMPLE_SET {
-                                            Store::set_on_shard(
-                                                &mut shard.data,
-                                                args[1],
-                                                args[2],
-                                                None,
-                                                now,
-                                            );
-                                            write_buf.extend_from_slice(resp::OK);
-                                        } else {
-                                            Store::get_and_write(
-                                                &shard.data,
-                                                args[1],
-                                                now,
-                                                &mut write_buf,
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    let shard = store.lock_read_shard(shard_idx as usize);
-                                    for args in &commands[i..batch_end] {
-                                        Store::get_and_write(
-                                            &shard.data,
-                                            args[1],
-                                            now,
-                                            &mut write_buf,
-                                        );
-                                    }
-                                }
-                            } else {
-                                for args in &commands[i..batch_end] {
-                                    cmd::execute(&store, &broker, args, &mut write_buf, now);
-                                }
+                            for args in &commands[i..batch_end] {
+                                cmd::execute(&store, &broker, args, &mut write_buf, now);
                             }
                         }
 
