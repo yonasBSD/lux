@@ -34,6 +34,7 @@ pub fn save(store: &Store) -> io::Result<usize> {
             DumpValue::Hash(_) => 'H',
             DumpValue::Set(_) => 'T',
             DumpValue::SortedSet(_) => 'Z',
+            DumpValue::Stream(..) => 'X',
         };
         let encoded_value = match &entry.value {
             DumpValue::Str(s) => s.clone(),
@@ -49,6 +50,19 @@ pub fn save(store: &Store) -> io::Result<usize> {
                 .map(|(m, s)| format!("{}\x1e{}", m, s))
                 .collect::<Vec<_>>()
                 .join("\x1f"),
+            DumpValue::Stream(entries, last_id) => {
+                let entries_str: Vec<String> = entries
+                    .iter()
+                    .map(|(id, fields)| {
+                        let flds: Vec<String> = fields
+                            .iter()
+                            .map(|(k, v)| format!("{}\x1d{}", k, v))
+                            .collect();
+                        format!("{}\x1d{}", id, flds.join("\x1d"))
+                    })
+                    .collect();
+                format!("{}\x1c{}", last_id, entries_str.join("\x1f"))
+            }
         };
         writeln!(
             file,
@@ -77,7 +91,7 @@ pub fn load(store: &Store) -> io::Result<usize> {
         }
 
         if !line.contains('\t')
-            || line.chars().next().is_none_or(|c| !"SLHTZ".contains(c))
+            || line.chars().next().is_none_or(|c| !"SLHTZX".contains(c))
             || line.chars().nth(1) != Some('\t')
         {
             let parts: Vec<&str> = line.splitn(3, '\t').collect();
@@ -164,6 +178,32 @@ pub fn load(store: &Store) -> io::Result<usize> {
                 };
                 DumpValue::SortedSet(members)
             }
+            "X" => {
+                let parts_x: Vec<&str> = raw_value.splitn(2, '\x1c').collect();
+                let last_id_str = if !parts_x.is_empty() {
+                    parts_x[0].to_string()
+                } else {
+                    "0-0".to_string()
+                };
+                let entries_raw = if parts_x.len() >= 2 { parts_x[1] } else { "" };
+                let mut entries = Vec::new();
+                if !entries_raw.is_empty() {
+                    for entry_str in entries_raw.split('\x1f') {
+                        let parts_e: Vec<&str> = entry_str.split('\x1d').collect();
+                        if !parts_e.is_empty() {
+                            let id = parts_e[0].to_string();
+                            let mut fields = Vec::new();
+                            let mut fi = 1;
+                            while fi + 1 < parts_e.len() {
+                                fields.push((parts_e[fi].to_string(), parts_e[fi + 1].to_string()));
+                                fi += 2;
+                            }
+                            entries.push((id, fields));
+                        }
+                    }
+                }
+                DumpValue::Stream(entries, last_id_str)
+            }
             _ => continue,
         };
 
@@ -209,6 +249,7 @@ mod tests {
                 DumpValue::Hash(_) => 'H',
                 DumpValue::Set(_) => 'T',
                 DumpValue::SortedSet(_) => 'Z',
+                DumpValue::Stream(..) => 'X',
             };
             let encoded_value = match &entry.value {
                 DumpValue::Str(s) => s.clone(),
@@ -224,6 +265,19 @@ mod tests {
                     .map(|(m, s)| format!("{}\x1e{}", m, s))
                     .collect::<Vec<_>>()
                     .join("\x1f"),
+                DumpValue::Stream(stream_entries, last_id) => {
+                    let entries_str: Vec<String> = stream_entries
+                        .iter()
+                        .map(|(id, fields)| {
+                            let flds: Vec<String> = fields
+                                .iter()
+                                .map(|(k, v)| format!("{}\x1d{}", k, v))
+                                .collect();
+                            format!("{}\x1d{}", id, flds.join("\x1d"))
+                        })
+                        .collect();
+                    format!("{}\x1c{}", last_id, entries_str.join("\x1f"))
+                }
             };
             writeln!(
                 file,
@@ -299,6 +353,35 @@ mod tests {
                         })
                         .collect(),
                 ),
+                "X" => {
+                    let parts_x: Vec<&str> = raw_value.splitn(2, '\x1c').collect();
+                    let last_id_str = if !parts_x.is_empty() {
+                        parts_x[0].to_string()
+                    } else {
+                        "0-0".to_string()
+                    };
+                    let entries_raw = if parts_x.len() >= 2 { parts_x[1] } else { "" };
+                    let mut entries = Vec::new();
+                    if !entries_raw.is_empty() {
+                        for entry_str in entries_raw.split('\x1f') {
+                            let parts_e: Vec<&str> = entry_str.split('\x1d').collect();
+                            if !parts_e.is_empty() {
+                                let id = parts_e[0].to_string();
+                                let mut fields = Vec::new();
+                                let mut fi = 1;
+                                while fi + 1 < parts_e.len() {
+                                    fields.push((
+                                        parts_e[fi].to_string(),
+                                        parts_e[fi + 1].to_string(),
+                                    ));
+                                    fi += 2;
+                                }
+                                entries.push((id, fields));
+                            }
+                        }
+                    }
+                    DumpValue::Stream(entries, last_id_str)
+                }
                 _ => continue,
             };
             store.load_entry(key, value, ttl);

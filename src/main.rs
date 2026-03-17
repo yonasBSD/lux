@@ -1,4 +1,5 @@
 mod cmd;
+mod lua;
 mod pubsub;
 mod resp;
 mod snapshot;
@@ -21,6 +22,7 @@ use tokio::sync::broadcast;
 pub static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_COMMANDS: AtomicUsize = AtomicUsize::new(0);
 pub static START_TIME: OnceLock<Instant> = OnceLock::new();
+static SCRIPT_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -34,6 +36,7 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     let store = Arc::new(Store::new());
     let broker = Broker::new();
+    let script_engine = Arc::new(lua::ScriptEngine::new());
 
     let require_auth = std::env::var("LUX_PASSWORD").is_ok_and(|p| !p.is_empty());
 
@@ -61,11 +64,13 @@ async fn main() -> std::io::Result<()> {
         let (socket, peer) = listener.accept().await?;
         let store = store.clone();
         let broker = broker.clone();
+        let script_engine = script_engine.clone();
         socket.set_nodelay(true).ok();
 
         tokio::spawn(async move {
             CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
-            let result = handle_connection(socket, peer, store, broker, require_auth).await;
+            let result =
+                handle_connection(socket, peer, store, broker, require_auth, script_engine).await;
             CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = result {
                 if e.kind() != std::io::ErrorKind::ConnectionReset {
@@ -94,12 +99,25 @@ fn is_tx_cmd(cmd: &[u8]) -> bool {
         || cmd_eq_fast(cmd, b"UNWATCH")
 }
 
+#[inline(always)]
+fn is_blocking_cmd(cmd: &[u8]) -> bool {
+    cmd_eq_fast(cmd, b"BLPOP")
+        || cmd_eq_fast(cmd, b"BRPOP")
+        || cmd_eq_fast(cmd, b"BLMOVE")
+        || cmd_eq_fast(cmd, b"BZPOPMIN")
+        || cmd_eq_fast(cmd, b"BZPOPMAX")
+        || cmd_eq_fast(cmd, b"EVAL")
+        || cmd_eq_fast(cmd, b"EVALSHA")
+        || cmd_eq_fast(cmd, b"SCRIPT")
+}
+
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     _peer: std::net::SocketAddr,
     store: Arc<Store>,
     broker: Broker,
     require_auth: bool,
+    script_engine: Arc<lua::ScriptEngine>,
 ) -> std::io::Result<()> {
     let mut read_buf = vec![0u8; 65536];
     let mut write_buf = BytesMut::with_capacity(65536);
@@ -216,6 +234,8 @@ async fn handle_connection(
             }
             let consumed = parser.pos();
 
+            let mut deferred_action: Option<CmdResult> = None;
+
             if commands.len() <= 1 {
                 for args in &commands {
                     if !authenticated
@@ -272,8 +292,11 @@ async fn handle_connection(
                                 for owned_args in &queue {
                                     let refs: Vec<&[u8]> =
                                         owned_args.iter().map(|v| v.as_slice()).collect();
-                                    match cmd::execute(&store, &broker, &refs, &mut write_buf, now)
-                                    {
+                                    let cmd_result = {
+                                        let _guard = SCRIPT_GATE.read();
+                                        cmd::execute(&store, &broker, &refs, &mut write_buf, now)
+                                    };
+                                    match cmd_result {
                                         CmdResult::Written => {}
                                         CmdResult::Authenticated => {
                                             authenticated = true;
@@ -284,6 +307,18 @@ async fn handle_connection(
                                         CmdResult::Publish { channel, message } => {
                                             let count = broker.publish(&channel, message).await;
                                             resp::write_integer(&mut write_buf, count);
+                                        }
+                                        CmdResult::BlockPop { .. }
+                                        | CmdResult::BlockMove { .. }
+                                        | CmdResult::BlockStreamRead { .. }
+                                        | CmdResult::BlockZPop { .. } => {
+                                            resp::write_error(&mut write_buf, "ERR blocking commands not allowed inside a transaction");
+                                        }
+                                        CmdResult::Eval { .. } | CmdResult::ScriptOp => {
+                                            resp::write_error(
+                                                &mut write_buf,
+                                                "ERR EVAL not supported in transaction",
+                                            );
                                         }
                                     }
                                 }
@@ -346,6 +381,17 @@ async fn handle_connection(
                                 ),
                             );
                             tx_error = true;
+                        } else if is_blocking_cmd(args[0]) {
+                            resp::write_error(
+                                &mut write_buf,
+                                &format!(
+                                    "ERR Command '{}' not allowed inside a transaction",
+                                    std::str::from_utf8(args[0])
+                                        .unwrap_or("unknown")
+                                        .to_lowercase()
+                                ),
+                            );
+                            tx_error = true;
                         } else if !cmd::is_known_command(args[0]) {
                             let cmd_name = std::str::from_utf8(args[0])
                                 .unwrap_or("unknown")
@@ -372,7 +418,11 @@ async fn handle_connection(
                         continue;
                     }
 
-                    match cmd::execute(&store, &broker, args, &mut write_buf, now) {
+                    let cmd_result = {
+                        let _guard = SCRIPT_GATE.read();
+                        cmd::execute(&store, &broker, args, &mut write_buf, now)
+                    };
+                    match cmd_result {
                         CmdResult::Written => {}
                         CmdResult::Authenticated => {
                             authenticated = true;
@@ -392,6 +442,32 @@ async fn handle_connection(
                         CmdResult::Publish { channel, message } => {
                             let count = broker.publish(&channel, message).await;
                             resp::write_integer(&mut write_buf, count);
+                        }
+                        CmdResult::BlockPop { .. }
+                        | CmdResult::BlockMove { .. }
+                        | CmdResult::BlockStreamRead { .. }
+                        | CmdResult::BlockZPop { .. } => {
+                            deferred_action = Some(cmd_result);
+                            break;
+                        }
+                        CmdResult::Eval { script, keys, argv } => {
+                            handle_eval(
+                                &mut write_buf,
+                                &store,
+                                &broker,
+                                &script_engine,
+                                &script,
+                                &keys,
+                                &argv,
+                                now,
+                            );
+                        }
+                        CmdResult::ScriptOp => {
+                            let owned_args: Vec<Vec<u8>> =
+                                args.iter().map(|a| a.to_vec()).collect();
+                            let refs: Vec<&[u8]> =
+                                owned_args.iter().map(|v| v.as_slice()).collect();
+                            handle_script_op(&mut write_buf, &script_engine, &refs);
                         }
                     }
                 }
@@ -414,6 +490,7 @@ async fn handle_connection(
                         || cmd_eq_fast(args[0], b"PUBLISH")
                         || cmd_eq_fast(args[0], b"AUTH")
                         || is_tx_cmd(args[0])
+                        || is_blocking_cmd(args[0])
                     {
                         has_special = true;
                         break;
@@ -496,13 +573,17 @@ async fn handle_connection(
                                     for owned_args in &queue {
                                         let refs: Vec<&[u8]> =
                                             owned_args.iter().map(|v| v.as_slice()).collect();
-                                        match cmd::execute(
-                                            &store,
-                                            &broker,
-                                            &refs,
-                                            &mut write_buf,
-                                            now,
-                                        ) {
+                                        let cmd_result = {
+                                            let _guard = SCRIPT_GATE.read();
+                                            cmd::execute(
+                                                &store,
+                                                &broker,
+                                                &refs,
+                                                &mut write_buf,
+                                                now,
+                                            )
+                                        };
+                                        match cmd_result {
                                             CmdResult::Written => {}
                                             CmdResult::Authenticated => {
                                                 authenticated = true;
@@ -513,6 +594,18 @@ async fn handle_connection(
                                             CmdResult::Publish { channel, message } => {
                                                 let count = broker.publish(&channel, message).await;
                                                 resp::write_integer(&mut write_buf, count);
+                                            }
+                                            CmdResult::BlockPop { .. }
+                                            | CmdResult::BlockMove { .. }
+                                            | CmdResult::BlockStreamRead { .. }
+                                            | CmdResult::BlockZPop { .. } => {
+                                                resp::write_error(&mut write_buf, "ERR blocking commands not allowed inside a transaction");
+                                            }
+                                            CmdResult::Eval { .. } | CmdResult::ScriptOp => {
+                                                resp::write_error(
+                                                    &mut write_buf,
+                                                    "ERR EVAL not supported in transaction",
+                                                );
                                             }
                                         }
                                     }
@@ -577,6 +670,17 @@ async fn handle_connection(
                                     ),
                                 );
                                 tx_error = true;
+                            } else if is_blocking_cmd(args[0]) {
+                                resp::write_error(
+                                    &mut write_buf,
+                                    &format!(
+                                        "ERR Command '{}' not allowed inside a transaction",
+                                        std::str::from_utf8(args[0])
+                                            .unwrap_or("unknown")
+                                            .to_lowercase()
+                                    ),
+                                );
+                                tx_error = true;
                             } else {
                                 match cmd::validate_args(args) {
                                     Ok(()) => {
@@ -594,7 +698,11 @@ async fn handle_connection(
                             continue;
                         }
 
-                        match cmd::execute(&store, &broker, args, &mut write_buf, now) {
+                        let cmd_result = {
+                            let _guard = SCRIPT_GATE.read();
+                            cmd::execute(&store, &broker, args, &mut write_buf, now)
+                        };
+                        match cmd_result {
                             CmdResult::Written => {}
                             CmdResult::Authenticated => {
                                 authenticated = true;
@@ -614,6 +722,32 @@ async fn handle_connection(
                             CmdResult::Publish { channel, message } => {
                                 let count = broker.publish(&channel, message).await;
                                 resp::write_integer(&mut write_buf, count);
+                            }
+                            CmdResult::BlockPop { .. }
+                            | CmdResult::BlockMove { .. }
+                            | CmdResult::BlockStreamRead { .. }
+                            | CmdResult::BlockZPop { .. } => {
+                                deferred_action = Some(cmd_result);
+                                break;
+                            }
+                            CmdResult::Eval { script, keys, argv } => {
+                                handle_eval(
+                                    &mut write_buf,
+                                    &store,
+                                    &broker,
+                                    &script_engine,
+                                    &script,
+                                    &keys,
+                                    &argv,
+                                    now,
+                                );
+                            }
+                            CmdResult::ScriptOp => {
+                                let owned_args: Vec<Vec<u8>> =
+                                    args.iter().map(|a| a.to_vec()).collect();
+                                let refs: Vec<&[u8]> =
+                                    owned_args.iter().map(|v| v.as_slice()).collect();
+                                handle_script_op(&mut write_buf, &script_engine, &refs);
                             }
                         }
                     }
@@ -717,12 +851,375 @@ async fn handle_connection(
                 }
             }
 
+            drop(commands);
             let _ = pending.split_to(consumed);
 
             if !write_buf.is_empty() {
                 socket.write_all(&write_buf).await?;
                 write_buf.clear();
             }
+
+            if let Some(action) = deferred_action {
+                match action {
+                    CmdResult::BlockPop {
+                        keys,
+                        timeout,
+                        pop_left,
+                    } => {
+                        handle_block_pop(&mut socket, &store, &broker, &keys, timeout, pop_left)
+                            .await?;
+                    }
+                    CmdResult::BlockMove {
+                        src,
+                        dst,
+                        src_left,
+                        dst_left,
+                        timeout,
+                    } => {
+                        handle_block_move(
+                            &mut socket,
+                            &store,
+                            &broker,
+                            &src,
+                            &dst,
+                            src_left,
+                            dst_left,
+                            timeout,
+                        )
+                        .await?;
+                    }
+                    CmdResult::BlockStreamRead {
+                        keys,
+                        ids,
+                        group,
+                        count,
+                        noack,
+                        timeout,
+                    } => {
+                        handle_block_stream_read(
+                            &mut socket,
+                            &store,
+                            &broker,
+                            &keys,
+                            &ids,
+                            group,
+                            count,
+                            noack,
+                            timeout,
+                        )
+                        .await?;
+                    }
+                    CmdResult::BlockZPop {
+                        keys,
+                        timeout,
+                        pop_min,
+                    } => {
+                        handle_block_zpop(&mut socket, &store, &keys, timeout, pop_min).await?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn handle_block_pop(
+    socket: &mut tokio::net::TcpStream,
+    _store: &Arc<Store>,
+    broker: &Broker,
+    keys: &[String],
+    timeout: std::time::Duration,
+    pop_left: bool,
+) -> std::io::Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, bytes::Bytes)>(1);
+    let waiter_id = broker.next_waiter_id();
+
+    for key in keys {
+        broker.register_list_waiter(
+            key,
+            pubsub::BlockedPopRequest {
+                tx: tx.clone(),
+                pop_left,
+                waiter_id,
+            },
+        );
+    }
+    drop(tx);
+
+    let mut write_buf = BytesMut::new();
+    let result = tokio::select! {
+        val = rx.recv() => val,
+        _ = tokio::time::sleep(timeout) => None,
+    };
+
+    match result {
+        Some((key, val)) => {
+            resp::write_array_header(&mut write_buf, 2);
+            resp::write_bulk(&mut write_buf, &key);
+            resp::write_bulk_raw(&mut write_buf, &val);
+        }
+        None => {
+            resp::write_null_array(&mut write_buf);
+        }
+    }
+
+    broker.remove_list_waiters_by_id(keys, waiter_id);
+
+    socket.write_all(&write_buf).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_block_move(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    broker: &Broker,
+    src: &str,
+    dst: &str,
+    src_left: bool,
+    dst_left: bool,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, bytes::Bytes)>(1);
+    let waiter_id = broker.next_waiter_id();
+
+    broker.register_list_waiter(
+        src,
+        pubsub::BlockedPopRequest {
+            tx: tx.clone(),
+            pop_left: src_left,
+            waiter_id,
+        },
+    );
+    drop(tx);
+
+    let mut write_buf = BytesMut::new();
+    let result = tokio::select! {
+        val = rx.recv() => val,
+        _ = tokio::time::sleep(timeout) => None,
+    };
+
+    match result {
+        Some((_key, val)) => {
+            let now = Instant::now();
+            let vals: Vec<&[u8]> = vec![val.as_ref()];
+            if dst_left {
+                let _ = store.lpush(dst.as_bytes(), &vals, now);
+            } else {
+                let _ = store.rpush(dst.as_bytes(), &vals, now);
+            }
+            resp::write_bulk_raw(&mut write_buf, &val);
+        }
+        None => {
+            resp::write_null(&mut write_buf);
+        }
+    }
+
+    broker.remove_list_waiters_by_id(&[src.to_string()], waiter_id);
+
+    socket.write_all(&write_buf).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_block_stream_read(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    broker: &Broker,
+    keys: &[String],
+    id_strs: &[String],
+    group: Option<(String, String)>,
+    count: Option<usize>,
+    noack: bool,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let now_pre = Instant::now();
+    let resolved_ids: Vec<String> = id_strs
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            if s == "$" {
+                store
+                    .stream_last_id(keys[idx].as_bytes(), now_pre)
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "0-0".to_string())
+            } else {
+                s.clone()
+            }
+        })
+        .collect();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    for key in keys {
+        broker.register_stream_waiter(key, tx.clone());
+    }
+    drop(tx);
+
+    let mut write_buf = BytesMut::new();
+    let woken = tokio::select! {
+        _ = rx.recv() => true,
+        _ = tokio::time::sleep(timeout) => false,
+    };
+
+    if woken {
+        let now = Instant::now();
+        let result = if let Some((ref grp, ref consumer)) = group {
+            store.xreadgroup(grp, consumer, keys, &resolved_ids, count, noack, now)
+        } else {
+            let ids: Vec<store::StreamId> = resolved_ids
+                .iter()
+                .map(|s| store::StreamId::parse(s).unwrap_or(store::StreamId::zero()))
+                .collect();
+            store.xread(keys, &ids, count, now)
+        };
+
+        match result {
+            Ok(r) if !r.is_empty() => {
+                write_xread_response(&mut write_buf, &r);
+            }
+            _ => {
+                resp::write_null_array(&mut write_buf);
+            }
+        }
+    } else {
+        resp::write_null_array(&mut write_buf);
+    }
+
+    socket.write_all(&write_buf).await
+}
+
+#[allow(clippy::type_complexity)]
+fn write_xread_response(
+    out: &mut BytesMut,
+    result: &[(String, Vec<(store::StreamId, Vec<(String, bytes::Bytes)>)>)],
+) {
+    resp::write_array_header(out, result.len());
+    for (key, entries) in result {
+        resp::write_array_header(out, 2);
+        resp::write_bulk(out, key);
+        resp::write_array_header(out, entries.len());
+        for (id, fields) in entries {
+            resp::write_array_header(out, 2);
+            resp::write_bulk(out, &id.to_string());
+            resp::write_array_header(out, fields.len() * 2);
+            for (k, v) in fields {
+                resp::write_bulk(out, k);
+                resp::write_bulk_raw(out, v);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_eval(
+    out: &mut BytesMut,
+    store: &Arc<Store>,
+    broker: &Broker,
+    script_engine: &lua::ScriptEngine,
+    script: &str,
+    keys: &[Vec<u8>],
+    argv: &[Vec<u8>],
+    now: Instant,
+) {
+    let actual_script = if let Some(sha) = script.strip_prefix("__SHA:") {
+        match script_engine.get(sha) {
+            Some(s) => s,
+            None => {
+                resp::write_error(out, "NOSCRIPT No matching script. Use EVAL.");
+                return;
+            }
+        }
+    } else {
+        script_engine.load(script);
+        script.to_string()
+    };
+
+    let _guard = SCRIPT_GATE.write();
+    match lua::eval(&actual_script, keys, argv, store, broker, now) {
+        Ok(result) => {
+            out.extend_from_slice(&result);
+        }
+        Err(e) => {
+            resp::write_error(out, &e);
+        }
+    }
+}
+
+async fn handle_block_zpop(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    keys: &[String],
+    timeout: std::time::Duration,
+    pop_min: bool,
+) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut write_buf = BytesMut::new();
+
+    loop {
+        let now = Instant::now();
+        for key in keys {
+            let result = if pop_min {
+                store.zpopmin(key.as_bytes(), 1, now)
+            } else {
+                store.zpopmax(key.as_bytes(), 1, now)
+            };
+            if let Ok(items) = result {
+                if !items.is_empty() {
+                    let (member, score) = &items[0];
+                    resp::write_array_header(&mut write_buf, 3);
+                    resp::write_bulk(&mut write_buf, key);
+                    resp::write_bulk(&mut write_buf, member);
+                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                        format!("{}", *score as i64)
+                    } else {
+                        format!("{}", score)
+                    };
+                    resp::write_bulk(&mut write_buf, &score_str);
+                    return socket.write_all(&write_buf).await;
+                }
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            resp::write_null_array(&mut write_buf);
+            return socket.write_all(&write_buf).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+fn handle_script_op(out: &mut BytesMut, script_engine: &lua::ScriptEngine, args: &[&[u8]]) {
+    if args.len() < 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'script' command");
+        return;
+    }
+    let sub = std::str::from_utf8(args[1]).unwrap_or("").to_uppercase();
+    match sub.as_str() {
+        "LOAD" => {
+            if args.len() < 3 {
+                resp::write_error(
+                    out,
+                    "ERR wrong number of arguments for 'script|load' command",
+                );
+                return;
+            }
+            let script = std::str::from_utf8(args[2]).unwrap_or("");
+            let sha = script_engine.load(script);
+            resp::write_bulk(out, &sha);
+        }
+        "EXISTS" => {
+            let count = args.len() - 2;
+            resp::write_array_header(out, count);
+            for arg in &args[2..] {
+                let sha = std::str::from_utf8(arg).unwrap_or("").to_lowercase();
+                resp::write_integer(out, if script_engine.exists(&sha) { 1 } else { 0 });
+            }
+        }
+        "FLUSH" => {
+            script_engine.flush();
+            resp::write_ok(out);
+        }
+        _ => {
+            resp::write_error(out, &format!("ERR unknown subcommand '{}'", sub));
         }
     }
 }
