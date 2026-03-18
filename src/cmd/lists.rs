@@ -1,0 +1,444 @@
+use bytes::{Bytes, BytesMut};
+use std::time::{Duration, Instant};
+
+use crate::pubsub::Broker;
+use crate::resp;
+use crate::store::{Store, StoreValue};
+
+use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
+
+pub fn cmd_lpush(
+    args: &[&[u8]],
+    store: &Store,
+    _broker: &Broker,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lpush' command");
+        return CmdResult::Written;
+    }
+    let vals: Vec<&[u8]> = args[2..].to_vec();
+    match store.lpush(args[1], &vals, now) {
+        Ok(n) => {
+            resp::write_integer(out, n);
+            let key_s = arg_str(args[1]);
+            if _broker.has_list_waiters(key_s) {
+                let shard_idx = store.shard_for_key(args[1]);
+                let mut shard = store.lock_write_shard(shard_idx);
+                _broker.drain_list_waiters(key_s, &mut shard.data, now);
+            }
+        }
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_rpush(
+    args: &[&[u8]],
+    store: &Store,
+    _broker: &Broker,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'rpush' command");
+        return CmdResult::Written;
+    }
+    let vals: Vec<&[u8]> = args[2..].to_vec();
+    match store.rpush(args[1], &vals, now) {
+        Ok(n) => {
+            resp::write_integer(out, n);
+            let key_s = arg_str(args[1]);
+            if _broker.has_list_waiters(key_s) {
+                let shard_idx = store.shard_for_key(args[1]);
+                let mut shard = store.lock_write_shard(shard_idx);
+                _broker.drain_list_waiters(key_s, &mut shard.data, now);
+            }
+        }
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_lpushx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lpushx' command");
+        return CmdResult::Written;
+    }
+    resp::write_integer(out, store.lpushx(args[1], &args[2..], now));
+    CmdResult::Written
+}
+
+pub fn cmd_rpushx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'rpushx' command");
+        return CmdResult::Written;
+    }
+    resp::write_integer(out, store.rpushx(args[1], &args[2..], now));
+    CmdResult::Written
+}
+
+pub fn cmd_lpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 2 || args.len() > 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lpop' command");
+        return CmdResult::Written;
+    }
+    if args.len() == 3 {
+        let count = parse_u64(args[2]).unwrap_or(1) as usize;
+        let idx = store.shard_for_key(args[1]);
+        let mut shard = store.lock_write_shard(idx);
+        shard.version += 1;
+        let ks = arg_str(args[1]);
+        match shard.data.get_mut(ks) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                if let StoreValue::List(list) = &mut entry.value {
+                    if count == 0 {
+                        resp::write_array_header(out, 0);
+                    } else {
+                        let n = count.min(list.len());
+                        let items: Vec<Bytes> = (0..n).filter_map(|_| list.pop_front()).collect();
+                        resp::write_array_header(out, items.len());
+                        for item in &items {
+                            resp::write_bulk_raw(out, item);
+                        }
+                    }
+                } else {
+                    resp::write_null(out);
+                }
+            }
+            _ => resp::write_null(out),
+        }
+    } else {
+        resp::write_optional_bulk_raw(out, &store.lpop(args[1], now));
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_rpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 2 || args.len() > 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'rpop' command");
+        return CmdResult::Written;
+    }
+    if args.len() == 3 {
+        let count = parse_u64(args[2]).unwrap_or(1) as usize;
+        let idx = store.shard_for_key(args[1]);
+        let mut shard = store.lock_write_shard(idx);
+        shard.version += 1;
+        let ks = arg_str(args[1]);
+        match shard.data.get_mut(ks) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                if let StoreValue::List(list) = &mut entry.value {
+                    if count == 0 {
+                        resp::write_array_header(out, 0);
+                    } else {
+                        let n = count.min(list.len());
+                        let items: Vec<Bytes> = (0..n).filter_map(|_| list.pop_back()).collect();
+                        resp::write_array_header(out, items.len());
+                        for item in &items {
+                            resp::write_bulk_raw(out, item);
+                        }
+                    }
+                } else {
+                    resp::write_null(out);
+                }
+            }
+            _ => resp::write_null(out),
+        }
+    } else {
+        resp::write_optional_bulk_raw(out, &store.rpop(args[1], now));
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_llen(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'llen' command");
+        return CmdResult::Written;
+    }
+    match store.llen(args[1], now) {
+        Ok(n) => resp::write_integer(out, n),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_lrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lrange' command");
+        return CmdResult::Written;
+    }
+    let start = parse_i64(args[2]).unwrap_or(0);
+    let stop = parse_i64(args[3]).unwrap_or(-1);
+    match store.lrange(args[1], start, stop, now) {
+        Ok(items) => resp::write_bulk_array_raw(out, &items),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_lindex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lindex' command");
+        return CmdResult::Written;
+    }
+    let index = parse_i64(args[2]).unwrap_or(0);
+    resp::write_optional_bulk_raw(out, &store.lindex(args[1], index, now));
+    CmdResult::Written
+}
+
+pub fn cmd_lset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lset' command");
+        return CmdResult::Written;
+    }
+    match store.lset(args[1], parse_i64(args[2]).unwrap_or(0), args[3], now) {
+        Ok(()) => resp::write_ok(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_linsert(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 5 {
+        resp::write_error(out, "ERR wrong number of arguments for 'linsert' command");
+        return CmdResult::Written;
+    }
+    match store.linsert(args[1], cmd_eq(args[2], b"BEFORE"), args[3], args[4], now) {
+        Ok(n) => resp::write_integer(out, n),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_lrem(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lrem' command");
+        return CmdResult::Written;
+    }
+    match store.lrem(args[1], parse_i64(args[2]).unwrap_or(0), args[3], now) {
+        Ok(n) => resp::write_integer(out, n),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_ltrim(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'ltrim' command");
+        return CmdResult::Written;
+    }
+    match store.ltrim(
+        args[1],
+        parse_i64(args[2]).unwrap_or(0),
+        parse_i64(args[3]).unwrap_or(-1),
+        now,
+    ) {
+        Ok(()) => resp::write_ok(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lpos' command");
+        return CmdResult::Written;
+    }
+    let key = args[1];
+    let element = args[2];
+    let mut rank = 1i64;
+    let mut count = None::<usize>;
+    let mut maxlen = 0usize;
+    let mut i = 3;
+    while i < args.len() {
+        if cmd_eq(args[i], b"RANK") && i + 1 < args.len() {
+            rank = parse_i64(args[i + 1]).unwrap_or(1);
+            if rank == 0 {
+                resp::write_error(out, "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list");
+                return CmdResult::Written;
+            }
+            i += 2;
+        } else if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
+            let c = parse_u64(args[i + 1]).unwrap_or(0) as usize;
+            count = Some(c);
+            i += 2;
+        } else if cmd_eq(args[i], b"MAXLEN") && i + 1 < args.len() {
+            maxlen = parse_u64(args[i + 1]).unwrap_or(0) as usize;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let idx = store.shard_for_key(key);
+    let shard = store.lock_read_shard(idx);
+    let ks = arg_str(key);
+    match shard.data.get(ks) {
+        Some(entry) if !entry.is_expired_at(now) => {
+            if let StoreValue::List(list) = &entry.value {
+                let len = if maxlen > 0 {
+                    maxlen.min(list.len())
+                } else {
+                    list.len()
+                };
+                let mut matches = Vec::new();
+                if rank > 0 {
+                    let mut found = 0i64;
+                    for (j, item) in list.iter().take(len).enumerate() {
+                        if item.as_ref() == element {
+                            found += 1;
+                            if found >= rank {
+                                matches.push(j as i64);
+                                if let Some(c) = count {
+                                    if c > 0 && matches.len() >= c {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mut found = 0i64;
+                    for j in (0..len).rev() {
+                        if list[j].as_ref() == element {
+                            found += 1;
+                            if found >= rank.abs() {
+                                matches.push(j as i64);
+                                if let Some(c) = count {
+                                    if c > 0 && matches.len() >= c {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if count.is_some() {
+                    resp::write_array_header(out, matches.len());
+                    for m in &matches {
+                        resp::write_integer(out, *m);
+                    }
+                } else if matches.is_empty() {
+                    resp::write_null(out);
+                } else {
+                    resp::write_integer(out, matches[0]);
+                }
+            } else {
+                resp::write_error(out, "WRONGTYPE");
+            }
+        }
+        _ => {
+            if count.is_some() {
+                resp::write_array_header(out, 0);
+            } else {
+                resp::write_null(out);
+            }
+        }
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_lmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 5 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lmove' command");
+        return CmdResult::Written;
+    }
+    resp::write_optional_bulk_raw(
+        out,
+        &store.lmove(
+            args[1],
+            args[2],
+            cmd_eq(args[3], b"LEFT"),
+            cmd_eq(args[4], b"LEFT"),
+            now,
+        ),
+    );
+    CmdResult::Written
+}
+
+pub fn cmd_rpoplpush(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(out, "ERR wrong number of arguments for 'rpoplpush' command");
+        return CmdResult::Written;
+    }
+    resp::write_optional_bulk_raw(out, &store.lmove(args[1], args[2], false, true, now));
+    CmdResult::Written
+}
+
+pub fn cmd_blpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 3 {
+        resp::write_error(
+            out,
+            &format!(
+                "ERR wrong number of arguments for '{}' command",
+                arg_str(args[0]).to_lowercase()
+            ),
+        );
+        return CmdResult::Written;
+    }
+    let pop_left = cmd_eq(args[0], b"BLPOP");
+    let timeout_secs: f64 = arg_str(args[args.len() - 1]).parse().unwrap_or(0.0);
+    let keys: Vec<String> = args[1..args.len() - 1]
+        .iter()
+        .map(|k| arg_str(k).to_string())
+        .collect();
+
+    for key in &keys {
+        let val = if pop_left {
+            store.lpop(key.as_bytes(), now)
+        } else {
+            store.rpop(key.as_bytes(), now)
+        };
+        if let Some(v) = val {
+            resp::write_array_header(out, 2);
+            resp::write_bulk(out, key);
+            resp::write_bulk_raw(out, &v);
+            return CmdResult::Written;
+        }
+    }
+
+    let timeout = if timeout_secs <= 0.0 {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs_f64(timeout_secs)
+    };
+    CmdResult::BlockPop {
+        keys,
+        timeout,
+        pop_left,
+    }
+}
+
+pub fn cmd_blmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 6 {
+        resp::write_error(out, "ERR wrong number of arguments for 'blmove' command");
+        return CmdResult::Written;
+    }
+    let src = arg_str(args[1]).to_string();
+    let dst = arg_str(args[2]).to_string();
+    let src_left = cmd_eq(args[3], b"LEFT");
+    let dst_left = cmd_eq(args[4], b"LEFT");
+    let timeout_secs: f64 = arg_str(args[5]).parse().unwrap_or(0.0);
+
+    if let Some(v) = store.lmove(args[1], args[2], src_left, dst_left, now) {
+        resp::write_bulk_raw(out, &v);
+        return CmdResult::Written;
+    }
+
+    let timeout = if timeout_secs <= 0.0 {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs_f64(timeout_secs)
+    };
+    CmdResult::BlockMove {
+        src,
+        dst,
+        src_left,
+        dst_left,
+        timeout,
+    }
+}
