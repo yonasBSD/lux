@@ -1,3 +1,5 @@
 /target
 *.dat
 *.dat.tmp
+sdk/node_modules/
+sdk/dist/
