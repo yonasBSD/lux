@@ -274,15 +274,24 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     }
     let cursor = parse_u64(args[2]).unwrap_or(0) as usize;
     let mut count = 10usize;
+    let mut pattern: Option<&[u8]> = None;
+    let mut novalues = false;
     let mut i = 3;
     while i < args.len() {
         if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
             count = parse_u64(args[i + 1]).unwrap_or(10) as usize;
             i += 2;
+        } else if cmd_eq(args[i], b"MATCH") && i + 1 < args.len() {
+            pattern = Some(args[i + 1]);
+            i += 2;
+        } else if cmd_eq(args[i], b"NOVALUES") {
+            novalues = true;
+            i += 1;
         } else {
             i += 1;
         }
     }
+    let pat_str = pattern.map(|p| arg_str(p).to_string());
     let idx = store.shard_for_key(args[1]);
     let shard = store.lock_read_shard(idx);
     let ks = arg_str(args[1]);
@@ -294,12 +303,26 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                     let s = cursor.min(all.len());
                     let e = (s + count).min(all.len());
                     let next = if e >= all.len() { 0 } else { e };
+                    let filtered: Vec<_> = all[s..e]
+                        .iter()
+                        .filter(|(k, _)| match &pat_str {
+                            Some(p) => glob_match(p, k),
+                            None => true,
+                        })
+                        .collect();
                     resp::write_array_header(out, 2);
                     resp::write_bulk(out, &next.to_string());
-                    resp::write_array_header(out, (e - s) * 2);
-                    for (k, v) in &all[s..e] {
-                        resp::write_bulk(out, k);
-                        resp::write_bulk_raw(out, v);
+                    if novalues {
+                        resp::write_array_header(out, filtered.len());
+                        for (k, _) in &filtered {
+                            resp::write_bulk(out, k);
+                        }
+                    } else {
+                        resp::write_array_header(out, filtered.len() * 2);
+                        for (k, v) in &filtered {
+                            resp::write_bulk(out, k);
+                            resp::write_bulk_raw(out, v);
+                        }
                     }
                 } else {
                     resp::write_error(out, "WRONGTYPE");
@@ -309,10 +332,17 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 let s = cursor.min(all.len());
                 let e = (s + count).min(all.len());
                 let next = if e >= all.len() { 0 } else { e };
+                let filtered: Vec<_> = all[s..e]
+                    .iter()
+                    .filter(|m| match &pat_str {
+                        Some(p) => glob_match(p, m),
+                        None => true,
+                    })
+                    .collect();
                 resp::write_array_header(out, 2);
                 resp::write_bulk(out, &next.to_string());
-                resp::write_array_header(out, e - s);
-                for m in &all[s..e] {
+                resp::write_array_header(out, filtered.len());
+                for m in &filtered {
                     resp::write_bulk(out, m);
                 }
             } else {
@@ -326,4 +356,37 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         }
     }
     CmdResult::Written
+}
+
+fn glob_match(pattern: &str, s: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = s.chars().collect();
+    do_glob(&p, &s, 0, 0)
+}
+
+fn do_glob(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
+    if pi == p.len() && si == s.len() {
+        return true;
+    }
+    if pi == p.len() {
+        return false;
+    }
+    if p[pi] == '*' {
+        for i in si..=s.len() {
+            if do_glob(p, s, pi + 1, i) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if si == s.len() {
+        return false;
+    }
+    if p[pi] == '?' || p[pi] == s[si] {
+        return do_glob(p, s, pi + 1, si + 1);
+    }
+    false
 }

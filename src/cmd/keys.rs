@@ -152,17 +152,26 @@ pub fn cmd_copy(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'copy' command");
         return CmdResult::Written;
     }
-    let replace = args.iter().any(|a| cmd_eq(a, b"REPLACE"));
-    if !replace && store.get(args[2], now).is_some() {
-        resp::write_integer(out, 0);
-    } else {
-        match store.get(args[1], now) {
-            Some(val) => {
-                store.set(args[2], &val, None, now);
-                resp::write_integer(out, 1);
+    let mut replace = false;
+    let mut i = 3;
+    while i < args.len() {
+        if cmd_eq(args[i], b"REPLACE") {
+            replace = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"DESTINATION") || cmd_eq(args[i], b"DB") {
+            if i + 1 < args.len() {
+                resp::write_error(out, "ERR COPY with DB is not supported");
+                return CmdResult::Written;
             }
-            None => resp::write_integer(out, 0),
+            i += 2;
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
+    }
+    match store.copy_key(args[1], args[2], replace, now) {
+        Ok(copied) => resp::write_integer(out, if copied { 1 } else { 0 }),
+        Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written
 }

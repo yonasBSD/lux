@@ -99,13 +99,45 @@ pub fn cmd_zadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             break;
         }
     }
+    if nx && xx {
+        resp::write_error(
+            out,
+            "ERR XX and NX options at the same time are not compatible",
+        );
+        return CmdResult::Written;
+    }
+    if nx && gt {
+        resp::write_error(
+            out,
+            "ERR GT, LT, and NX options at the same time are not compatible",
+        );
+        return CmdResult::Written;
+    }
+    if nx && lt {
+        resp::write_error(
+            out,
+            "ERR GT, LT, and NX options at the same time are not compatible",
+        );
+        return CmdResult::Written;
+    }
+    if gt && lt {
+        resp::write_error(
+            out,
+            "ERR GT, LT, and NX options at the same time are not compatible",
+        );
+        return CmdResult::Written;
+    }
     if !(args.len() - i).is_multiple_of(2) || i >= args.len() {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
     let mut members = Vec::new();
     while i + 1 < args.len() {
-        let score: f64 = match arg_str(args[i]).parse() {
+        let score: f64 = match arg_str(args[i]).parse::<f64>() {
+            Ok(s) if s.is_nan() => {
+                resp::write_error(out, "ERR value is not a valid float");
+                return CmdResult::Written;
+            }
             Ok(s) => s,
             Err(_) => {
                 resp::write_error(out, "ERR value is not a valid float");
@@ -249,7 +281,11 @@ pub fn cmd_zincrby(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         resp::write_error(out, "ERR wrong number of arguments for 'zincrby' command");
         return CmdResult::Written;
     }
-    let increment: f64 = match arg_str(args[2]).parse() {
+    let increment: f64 = match arg_str(args[2]).parse::<f64>() {
+        Ok(d) if d.is_nan() => {
+            resp::write_error(out, "ERR value is not a valid float");
+            return CmdResult::Written;
+        }
         Ok(d) => d,
         Err(_) => {
             resp::write_error(out, "ERR value is not a valid float");

@@ -85,7 +85,17 @@ pub fn cmd_lpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         return CmdResult::Written;
     }
     if args.len() == 3 {
-        let count = parse_u64(args[2]).unwrap_or(1) as usize;
+        let count = match parse_i64(args[2]) {
+            Ok(c) if c < 0 => {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return CmdResult::Written;
+            }
+            Ok(c) => c as usize,
+            Err(_) => {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return CmdResult::Written;
+            }
+        };
         let idx = store.shard_for_key(args[1]);
         let mut shard = store.lock_write_shard(idx);
         shard.version += 1;
@@ -104,10 +114,13 @@ pub fn cmd_lpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                         }
                     }
                 } else {
-                    resp::write_null(out);
+                    resp::write_error(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
-            _ => resp::write_null(out),
+            _ => resp::write_null_array(out),
         }
     } else {
         resp::write_optional_bulk_raw(out, &store.lpop(args[1], now));
@@ -121,7 +134,17 @@ pub fn cmd_rpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         return CmdResult::Written;
     }
     if args.len() == 3 {
-        let count = parse_u64(args[2]).unwrap_or(1) as usize;
+        let count = match parse_i64(args[2]) {
+            Ok(c) if c < 0 => {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return CmdResult::Written;
+            }
+            Ok(c) => c as usize,
+            Err(_) => {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return CmdResult::Written;
+            }
+        };
         let idx = store.shard_for_key(args[1]);
         let mut shard = store.lock_write_shard(idx);
         shard.version += 1;
@@ -140,10 +163,13 @@ pub fn cmd_rpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                         }
                     }
                 } else {
-                    resp::write_null(out);
+                    resp::write_error(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
-            _ => resp::write_null(out),
+            _ => resp::write_null_array(out),
         }
     } else {
         resp::write_optional_bulk_raw(out, &store.rpop(args[1], now));
@@ -258,6 +284,10 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                 resp::write_error(out, "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list");
                 return CmdResult::Written;
             }
+            if rank == i64::MIN {
+                resp::write_error(out, "ERR value is out of range");
+                return CmdResult::Written;
+            }
             i += 2;
         } else if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
             let c = parse_u64(args[i + 1]).unwrap_or(0) as usize;
@@ -276,15 +306,16 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     match shard.data.get(ks) {
         Some(entry) if !entry.is_expired_at(now) => {
             if let StoreValue::List(list) = &entry.value {
-                let len = if maxlen > 0 {
-                    maxlen.min(list.len())
-                } else {
-                    list.len()
-                };
+                let list_len = list.len();
                 let mut matches = Vec::new();
                 if rank > 0 {
+                    let scan_len = if maxlen > 0 {
+                        maxlen.min(list_len)
+                    } else {
+                        list_len
+                    };
                     let mut found = 0i64;
-                    for (j, item) in list.iter().take(len).enumerate() {
+                    for (j, item) in list.iter().take(scan_len).enumerate() {
                         if item.as_ref() == element {
                             found += 1;
                             if found >= rank {
@@ -300,8 +331,13 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                         }
                     }
                 } else {
+                    let start = if maxlen > 0 && maxlen < list_len {
+                        list_len - maxlen
+                    } else {
+                        0
+                    };
                     let mut found = 0i64;
-                    for j in (0..len).rev() {
+                    for j in (start..list_len).rev() {
                         if list[j].as_ref() == element {
                             found += 1;
                             if found >= rank.abs() {

@@ -723,6 +723,75 @@ impl Store {
         Ok(())
     }
 
+    pub fn copy_key(
+        &self,
+        src: &[u8],
+        dst: &[u8],
+        replace: bool,
+        now: Instant,
+    ) -> Result<bool, String> {
+        let src_idx = self.shard_index(src);
+        let dst_idx = self.shard_index(dst);
+
+        let (dump_val, ttl) = {
+            let shard = self.shards[src_idx].read();
+            let ks = key_str(src);
+            match shard.data.get(ks) {
+                Some(entry) if !entry.is_expired_at(now) => {
+                    let ttl = entry.expires_at.map(|exp| exp.duration_since(now));
+                    let dv = match &entry.value {
+                        StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
+                        StoreValue::List(l) => {
+                            DumpValue::List(l.iter().map(|b| b.to_vec()).collect())
+                        }
+                        StoreValue::Hash(h) => DumpValue::Hash(
+                            h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect(),
+                        ),
+                        StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
+                        StoreValue::SortedSet(_, scores) => DumpValue::SortedSet(
+                            scores.iter().map(|(m, s)| (m.clone(), *s)).collect(),
+                        ),
+                        StoreValue::Stream(s) => {
+                            let entries: Vec<StreamDumpEntry> = s
+                                .entries
+                                .iter()
+                                .map(|(id, fields)| {
+                                    let flds: Vec<(String, Vec<u8>)> = fields
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.to_vec()))
+                                        .collect();
+                                    (id.to_string(), flds)
+                                })
+                                .collect();
+                            DumpValue::Stream(entries, s.last_id.to_string())
+                        }
+                        StoreValue::Vector(v) => {
+                            DumpValue::Vector(v.data.clone(), v.metadata.clone())
+                        }
+                        StoreValue::HyperLogLog(regs, cached) => {
+                            DumpValue::HyperLogLog(regs.clone(), *cached)
+                        }
+                    };
+                    (dv, ttl)
+                }
+                _ => return Ok(false),
+            }
+        };
+
+        if !replace {
+            let shard = self.shards[dst_idx].read();
+            let ks = key_str(dst);
+            if let Some(entry) = shard.data.get(ks) {
+                if !entry.is_expired_at(now) {
+                    return Ok(false);
+                }
+            }
+        }
+
+        self.load_entry(key_string(dst), dump_val, ttl);
+        Ok(true)
+    }
+
     pub fn dbsize(&self, now: Instant) -> i64 {
         let mut total = 0i64;
         for shard in self.shards.iter() {
@@ -2735,6 +2804,11 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let is_new = !shard.data.contains_key(&ks)
+            || shard.data.get(&ks).is_some_and(|e| e.is_expired_at(now));
+        if xx && is_new {
+            return Ok(0);
+        }
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
             expires_at: None,

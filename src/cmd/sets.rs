@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::resp;
 use crate::store::Store;
 
-use super::{parse_i64, parse_u64, CmdResult};
+use super::{cmd_eq, parse_i64, parse_u64, CmdResult};
 
 pub fn cmd_sadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
@@ -66,6 +66,14 @@ pub fn cmd_smismember(
         resp::write_error(
             out,
             "ERR wrong number of arguments for 'smismember' command",
+        );
+        return CmdResult::Written;
+    }
+    let key_type = store.get_entry_type(args[1], now);
+    if key_type.is_some() && key_type != Some("set") {
+        resp::write_error(
+            out,
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
         );
         return CmdResult::Written;
     }
@@ -281,13 +289,41 @@ pub fn cmd_sintercard(
         );
         return CmdResult::Written;
     }
-    let numkeys = parse_u64(args[1]).unwrap_or(0) as usize;
+    let numkeys = match parse_i64(args[1]) {
+        Ok(n) if n > 0 => n as usize,
+        Ok(_) => {
+            resp::write_error(out, "ERR numkeys can't be non-positive value");
+            return CmdResult::Written;
+        }
+        _ => {
+            resp::write_error(out, "ERR value is not an integer or out of range");
+            return CmdResult::Written;
+        }
+    };
     if 2 + numkeys > args.len() {
+        resp::write_error(
+            out,
+            "ERR Number of keys can't be greater than number of args",
+        );
+        return CmdResult::Written;
+    }
+    let mut limit: usize = 0;
+    let rest = &args[2 + numkeys..];
+    if rest.len() == 2 && cmd_eq(rest[0], b"LIMIT") {
+        limit = parse_u64(rest[1]).unwrap_or(0) as usize;
+    } else if !rest.is_empty() {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
     match store.sinter(&args[2..2 + numkeys], now) {
-        Ok(r) => resp::write_integer(out, r.len() as i64),
+        Ok(r) => {
+            let count = if limit > 0 {
+                r.len().min(limit)
+            } else {
+                r.len()
+            };
+            resp::write_integer(out, count as i64);
+        }
         Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written
