@@ -27,6 +27,9 @@ pub enum CmdResult {
     Subscribe {
         channels: Vec<String>,
     },
+    PSubscribe {
+        patterns: Vec<String>,
+    },
     Publish {
         channel: String,
         message: String,
@@ -461,9 +464,11 @@ pub fn execute(
                 resp::write_ok(out);
                 return CmdResult::Written;
             }
-            if cmd_eq(cmd, b"PSUBSCRIBE") || cmd_eq(cmd, b"PUNSUBSCRIBE") {
-                resp::write_ok(out);
-                return CmdResult::Written;
+            if cmd_eq(cmd, b"PSUBSCRIBE") {
+                return pubsub::cmd_psubscribe(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"PUNSUBSCRIBE") {
+                return pubsub::cmd_punsubscribe(args, store, out, now);
             }
         }
         b'Q' => {

@@ -41,3 +41,31 @@ pub fn cmd_unsubscribe(
     resp::write_ok(out);
     CmdResult::Written
 }
+
+pub fn cmd_psubscribe(
+    args: &[&[u8]],
+    _store: &Store,
+    out: &mut BytesMut,
+    _now: Instant,
+) -> CmdResult {
+    if args.len() < 2 {
+        resp::write_error(
+            out,
+            "ERR wrong number of arguments for 'psubscribe' command",
+        );
+        return CmdResult::Written;
+    }
+    CmdResult::PSubscribe {
+        patterns: args[1..].iter().map(|a| arg_str(a).to_string()).collect(),
+    }
+}
+
+pub fn cmd_punsubscribe(
+    _args: &[&[u8]],
+    _store: &Store,
+    out: &mut BytesMut,
+    _now: Instant,
+) -> CmdResult {
+    resp::write_ok(out);
+    CmdResult::Written
+}

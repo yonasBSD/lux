@@ -171,14 +171,14 @@ async fn handle_tx_cmd(
                         CmdResult::Authenticated => {
                             *authenticated = true;
                         }
-                        CmdResult::Subscribe { .. } => {
+                        CmdResult::Subscribe { .. } | CmdResult::PSubscribe { .. } => {
                             resp::write_error(
                                 write_buf,
                                 "ERR Command 'subscribe' not allowed inside a transaction",
                             );
                         }
                         CmdResult::Publish { channel, message } => {
-                            let count = broker.publish(&channel, message).await;
+                            let count = broker.publish(&channel, message);
                             resp::write_integer(write_buf, count);
                         }
                         CmdResult::BlockPop { .. }
@@ -313,6 +313,7 @@ async fn handle_connection(
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut pending = BytesMut::new();
     let mut subscriptions: HashMap<String, broadcast::Receiver<pubsub::Message>> = HashMap::new();
+    let mut pattern_subs: HashMap<String, broadcast::Receiver<pubsub::Message>> = HashMap::new();
     let mut sub_mode = false;
     let mut authenticated = !require_auth;
     let mut in_multi = false;
@@ -338,13 +339,13 @@ async fn handle_connection(
                             for ch_bytes in &args[1..] {
                                 let ch = std::str::from_utf8(ch_bytes).unwrap_or("").to_string();
                                 if !subscriptions.contains_key(&ch) {
-                                    let rx = broker.subscribe(&ch).await;
+                                    let rx = broker.subscribe(&ch);
                                     subscriptions.insert(ch.clone(), rx);
                                 }
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "subscribe");
                                 resp::write_bulk(&mut write_buf, &ch);
-                                resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len()) as i64);
                             }
                         } else if cmd_eq_fast(args[0], b"UNSUBSCRIBE") {
                             let channels: Vec<String> = if args.len() > 1 {
@@ -357,9 +358,37 @@ async fn handle_connection(
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "unsubscribe");
                                 resp::write_bulk(&mut write_buf, ch);
-                                resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len()) as i64);
                             }
-                            if subscriptions.is_empty() {
+                            if subscriptions.is_empty() && pattern_subs.is_empty() {
+                                sub_mode = false;
+                            }
+                        } else if cmd_eq_fast(args[0], b"PSUBSCRIBE") {
+                            for pat_bytes in &args[1..] {
+                                let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
+                                if !pattern_subs.contains_key(&pat) {
+                                    let rx = broker.psubscribe(&pat);
+                                    pattern_subs.insert(pat.clone(), rx);
+                                }
+                                resp::write_array_header(&mut write_buf, 3);
+                                resp::write_bulk(&mut write_buf, "psubscribe");
+                                resp::write_bulk(&mut write_buf, &pat);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len()) as i64);
+                            }
+                        } else if cmd_eq_fast(args[0], b"PUNSUBSCRIBE") {
+                            let patterns: Vec<String> = if args.len() > 1 {
+                                args[1..].iter().map(|a| std::str::from_utf8(a).unwrap_or("").to_string()).collect()
+                            } else {
+                                pattern_subs.keys().cloned().collect()
+                            };
+                            for pat in &patterns {
+                                pattern_subs.remove(pat);
+                                resp::write_array_header(&mut write_buf, 3);
+                                resp::write_bulk(&mut write_buf, "punsubscribe");
+                                resp::write_bulk(&mut write_buf, pat);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len()) as i64);
+                            }
+                            if subscriptions.is_empty() && pattern_subs.is_empty() {
                                 sub_mode = false;
                             }
                         } else if cmd_eq_fast(args[0], b"PING") {
@@ -386,8 +415,18 @@ async fn handle_connection(
                             return Some(msg);
                         }
                     }
+                    for (_pat, rx) in pattern_subs.iter_mut() {
+                        if let Ok(msg) = rx.try_recv() {
+                            return Some(msg);
+                        }
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     for (_ch, rx) in subscriptions.iter_mut() {
+                        if let Ok(msg) = rx.try_recv() {
+                            return Some(msg);
+                        }
+                    }
+                    for (_pat, rx) in pattern_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(msg);
                         }
@@ -395,10 +434,18 @@ async fn handle_connection(
                     None
                 } => {
                     if let Some(msg) = msg {
-                        resp::write_array_header(&mut write_buf, 3);
-                        resp::write_bulk(&mut write_buf, "message");
-                        resp::write_bulk(&mut write_buf, &msg.channel);
-                        resp::write_bulk(&mut write_buf, &msg.payload);
+                        if let Some(ref pat) = msg.pattern {
+                            resp::write_array_header(&mut write_buf, 4);
+                            resp::write_bulk(&mut write_buf, "pmessage");
+                            resp::write_bulk(&mut write_buf, pat);
+                            resp::write_bulk(&mut write_buf, &msg.channel);
+                            resp::write_bulk(&mut write_buf, &msg.payload);
+                        } else {
+                            resp::write_array_header(&mut write_buf, 3);
+                            resp::write_bulk(&mut write_buf, "message");
+                            resp::write_bulk(&mut write_buf, &msg.channel);
+                            resp::write_bulk(&mut write_buf, &msg.payload);
+                        }
                         socket.write_all(&write_buf).await?;
                         write_buf.clear();
                     }
@@ -466,18 +513,36 @@ async fn handle_connection(
                         }
                         CmdResult::Subscribe { channels } => {
                             for ch in &channels {
-                                let rx = broker.subscribe(ch).await;
+                                let rx = broker.subscribe(ch);
                                 subscriptions.insert(ch.clone(), rx);
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "subscribe");
                                 resp::write_bulk(&mut write_buf, ch);
-                                resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                resp::write_integer(
+                                    &mut write_buf,
+                                    (subscriptions.len() + pattern_subs.len()) as i64,
+                                );
+                            }
+                            sub_mode = true;
+                            break;
+                        }
+                        CmdResult::PSubscribe { patterns } => {
+                            for pat in &patterns {
+                                let rx = broker.psubscribe(pat);
+                                pattern_subs.insert(pat.clone(), rx);
+                                resp::write_array_header(&mut write_buf, 3);
+                                resp::write_bulk(&mut write_buf, "psubscribe");
+                                resp::write_bulk(&mut write_buf, pat);
+                                resp::write_integer(
+                                    &mut write_buf,
+                                    (subscriptions.len() + pattern_subs.len()) as i64,
+                                );
                             }
                             sub_mode = true;
                             break;
                         }
                         CmdResult::Publish { channel, message } => {
-                            let count = broker.publish(&channel, message).await;
+                            let count = broker.publish(&channel, message);
                             resp::write_integer(&mut write_buf, count);
                         }
                         CmdResult::BlockPop { .. }
@@ -524,6 +589,7 @@ async fn handle_connection(
                         break;
                     }
                     if cmd_eq_fast(args[0], b"SUBSCRIBE")
+                        || cmd_eq_fast(args[0], b"PSUBSCRIBE")
                         || cmd_eq_fast(args[0], b"PUBLISH")
                         || cmd_eq_fast(args[0], b"AUTH")
                         || is_tx_cmd(args[0])
@@ -595,18 +661,36 @@ async fn handle_connection(
                             }
                             CmdResult::Subscribe { channels } => {
                                 for ch in &channels {
-                                    let rx = broker.subscribe(ch).await;
+                                    let rx = broker.subscribe(ch);
                                     subscriptions.insert(ch.clone(), rx);
                                     resp::write_array_header(&mut write_buf, 3);
                                     resp::write_bulk(&mut write_buf, "subscribe");
                                     resp::write_bulk(&mut write_buf, ch);
-                                    resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                    resp::write_integer(
+                                        &mut write_buf,
+                                        (subscriptions.len() + pattern_subs.len()) as i64,
+                                    );
+                                }
+                                sub_mode = true;
+                                break;
+                            }
+                            CmdResult::PSubscribe { patterns } => {
+                                for pat in &patterns {
+                                    let rx = broker.psubscribe(pat);
+                                    pattern_subs.insert(pat.clone(), rx);
+                                    resp::write_array_header(&mut write_buf, 3);
+                                    resp::write_bulk(&mut write_buf, "psubscribe");
+                                    resp::write_bulk(&mut write_buf, pat);
+                                    resp::write_integer(
+                                        &mut write_buf,
+                                        (subscriptions.len() + pattern_subs.len()) as i64,
+                                    );
                                 }
                                 sub_mode = true;
                                 break;
                             }
                             CmdResult::Publish { channel, message } => {
-                                let count = broker.publish(&channel, message).await;
+                                let count = broker.publish(&channel, message);
                                 resp::write_integer(&mut write_buf, count);
                             }
                             CmdResult::BlockPop { .. }
