@@ -200,7 +200,7 @@ Built for reactive applications, cache invalidation, live dashboards, and any us
 ### SDK
 
 ```bash
-npm install @luxdb/sdk
+bun i @luxdb/sdk
 ```
 
 ```typescript
@@ -243,7 +243,7 @@ Extends ioredis with typed methods for vectors, time series, and realtime key su
 ### Node.js
 
 ```bash
-npm install @luxdb/sdk   # or: npm install ioredis
+bun i @luxdb/sdk   # or: bun i ioredis
 ```
 
 ```typescript

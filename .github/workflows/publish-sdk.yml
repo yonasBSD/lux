@@ -20,7 +20,9 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
-      - run: cd sdk && npm install && npm run build
+      - uses: oven-sh/setup-bun@v2
+
+      - run: cd sdk && bun install && bun run build
 
       - run: cd sdk && npm publish --access public --provenance
         env:
