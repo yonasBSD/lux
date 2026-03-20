@@ -1,7 +1,7 @@
 {
     "name": "@luxdb/sdk",
     "version": "1.0.0",
-    "description": "Lux SDK - ioredis extended with native vector search",
+    "description": "Lux SDK - ioredis extended with vector search, time series, and realtime key subscriptions",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "files": ["dist"],
@@ -13,6 +13,7 @@
         "ioredis": "^5.0.0"
     },
     "devDependencies": {
+        "@types/node": "^25.5.0",
         "typescript": "^5.9.0"
     },
     "peerDependencies": {
@@ -24,5 +25,5 @@
         "url": "https://github.com/lux-db/lux",
         "directory": "sdk"
     },
-    "keywords": ["lux", "redis", "vector", "search", "database", "ioredis", "similarity"]
+    "keywords": ["lux", "redis", "vector", "search", "database", "ioredis", "similarity", "timeseries", "realtime", "subscriptions"]
 }

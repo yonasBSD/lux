@@ -211,11 +211,20 @@ const db = new Lux("redis://localhost:6379")
 await db.set("hello", "world")
 
 await db.vset("doc:1", embedding, { metadata: { title: "my doc" } })
-
 const results = await db.vsearch(queryEmbedding, { k: 5, meta: true })
+
+await db.tsadd("cpu:host1", '*', 72.5, { labels: { host: "server1" } })
+const latest = await db.tsget("cpu:host1")
+const range = await db.tsrange("cpu:host1", '-', '+', {
+  aggregation: { type: 'avg', bucketSize: 3600000 }
+})
+
+const sub = db.ksub(["user:*"], (event) => {
+  console.log(`${event.key} was ${event.operation}`)
+})
 ```
 
-Extends ioredis with typed methods for vector operations. All standard Redis commands work as usual.
+Extends ioredis with typed methods for vectors, time series, and realtime key subscriptions. All standard Redis commands work as usual.
 
 ### Environment Variables
 
