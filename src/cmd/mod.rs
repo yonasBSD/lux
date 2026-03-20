@@ -1,3 +1,4 @@
+mod bitops;
 mod geo;
 mod hashes;
 mod hll;
@@ -156,6 +157,15 @@ pub fn execute(
             if cmd_eq(cmd, b"BZPOPMIN") || cmd_eq(cmd, b"BZPOPMAX") {
                 return sorted_sets::cmd_bzpopmin(args, store, out, now);
             }
+            if cmd_eq(cmd, b"BITCOUNT") {
+                return bitops::cmd_bitcount(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"BITPOS") {
+                return bitops::cmd_bitpos(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"BITOP") {
+                return bitops::cmd_bitop(args, store, out, now);
+            }
         }
         b'C' => {
             if cmd_eq(cmd, b"CONFIG") {
@@ -230,6 +240,9 @@ pub fn execute(
         b'G' => {
             if cmd_eq(cmd, b"GET") {
                 return strings::cmd_get(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"GETBIT") {
+                return bitops::cmd_getbit(args, store, out, now);
             }
             if cmd_eq(cmd, b"GETSET") {
                 return strings::cmd_getset(args, store, out, now);
@@ -487,6 +500,9 @@ pub fn execute(
         b'S' => {
             if cmd_eq(cmd, b"SET") {
                 return strings::cmd_set(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"SETBIT") {
+                return bitops::cmd_setbit(args, store, out, now);
             }
             if cmd_eq(cmd, b"SETNX") {
                 return strings::cmd_setnx(args, store, out, now);
@@ -1645,6 +1661,11 @@ pub fn is_known_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"PFCOUNT")
         || cmd_eq(cmd, b"PFMERGE")
         || cmd_eq(cmd, b"PFDEBUG")
+        || cmd_eq(cmd, b"SETBIT")
+        || cmd_eq(cmd, b"GETBIT")
+        || cmd_eq(cmd, b"BITCOUNT")
+        || cmd_eq(cmd, b"BITPOS")
+        || cmd_eq(cmd, b"BITOP")
 }
 
 pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {
@@ -1664,6 +1685,7 @@ pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {
         || cmd_eq(cmd, b"LINDEX")
         || cmd_eq(cmd, b"GETRANGE")
         || cmd_eq(cmd, b"SUBSTR")
+        || cmd_eq(cmd, b"GETBIT")
     {
         3
     } else if cmd_eq(cmd, b"GET")
@@ -1735,6 +1757,8 @@ pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {
         || cmd_eq(cmd, b"ZINCRBY")
         || cmd_eq(cmd, b"SMOVE")
         || cmd_eq(cmd, b"HSTRLEN")
+        || cmd_eq(cmd, b"SETBIT")
+        || cmd_eq(cmd, b"BITOP")
     {
         4
     } else if cmd_eq(cmd, b"XADD") || cmd_eq(cmd, b"XREADGROUP") {
@@ -1761,6 +1785,8 @@ pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {
         || cmd_eq(cmd, b"PFADD")
         || cmd_eq(cmd, b"PFCOUNT")
         || cmd_eq(cmd, b"PFMERGE")
+        || cmd_eq(cmd, b"BITCOUNT")
+        || cmd_eq(cmd, b"BITPOS")
     {
         2
     } else if cmd_eq(cmd, b"BLMOVE") || cmd_eq(cmd, b"XCLAIM") || cmd_eq(cmd, b"XAUTOCLAIM") {

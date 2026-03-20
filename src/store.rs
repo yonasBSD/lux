@@ -2289,6 +2289,292 @@ impl Store {
         true
     }
 
+    pub fn setbit(&self, key: &[u8], offset: u64, value: u8, now: Instant) -> Result<u8, String> {
+        let byte_idx = (offset / 8) as usize;
+        let bit_idx = 7 - (offset % 8) as u8;
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        let ks = key_string(key);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::Str(Bytes::new()),
+            expires_at: None,
+            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+        });
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::Str(Bytes::new());
+            entry.expires_at = None;
+        }
+        match &entry.value {
+            StoreValue::Str(s) => {
+                let mut buf = s.to_vec();
+                if buf.len() <= byte_idx {
+                    buf.resize(byte_idx + 1, 0);
+                }
+                let old = (buf[byte_idx] >> bit_idx) & 1;
+                if value == 1 {
+                    buf[byte_idx] |= 1 << bit_idx;
+                } else {
+                    buf[byte_idx] &= !(1 << bit_idx);
+                }
+                entry.value = StoreValue::Str(Bytes::from(buf));
+                Ok(old)
+            }
+            _ => Err(WRONGTYPE.to_string()),
+        }
+    }
+
+    pub fn getbit(&self, key: &[u8], offset: u64, now: Instant) -> Result<u8, String> {
+        let byte_idx = (offset / 8) as usize;
+        let bit_idx = 7 - (offset % 8) as u8;
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Str(s) => {
+                    if byte_idx >= s.len() {
+                        Ok(0)
+                    } else {
+                        Ok((s[byte_idx] >> bit_idx) & 1)
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    pub fn bitcount(
+        &self,
+        key: &[u8],
+        start: i64,
+        end: i64,
+        use_bit: bool,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Str(s) => {
+                    if use_bit {
+                        let bit_len = s.len() as i64 * 8;
+                        let s_idx = if start < 0 {
+                            (bit_len + start).max(0) as usize
+                        } else {
+                            (start as usize).min(bit_len as usize)
+                        };
+                        let e_idx = if end < 0 {
+                            (bit_len + end).max(0) as usize
+                        } else {
+                            (end as usize).min(bit_len as usize - 1)
+                        };
+                        if s_idx > e_idx {
+                            return Ok(0);
+                        }
+                        let mut count = 0i64;
+                        for i in s_idx..=e_idx {
+                            let byte_pos = i / 8;
+                            let bit_pos = 7 - (i % 8);
+                            if byte_pos < s.len() && (s[byte_pos] >> bit_pos) & 1 == 1 {
+                                count += 1;
+                            }
+                        }
+                        Ok(count)
+                    } else {
+                        let len = s.len() as i64;
+                        let s_resolved = if start < 0 { len + start } else { start };
+                        let e_resolved = if end < 0 { len + end } else { end };
+                        if s_resolved > e_resolved {
+                            return Ok(0);
+                        }
+                        let s_idx = s_resolved.max(0) as usize;
+                        let e_idx =
+                            e_resolved.max(0).min(if len > 0 { len - 1 } else { 0 }) as usize;
+                        if s_idx > e_idx || s.is_empty() {
+                            return Ok(0);
+                        }
+                        let mut count = 0i64;
+                        for &byte in &s[s_idx..=e_idx] {
+                            count += byte.count_ones() as i64;
+                        }
+                        Ok(count)
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bitpos(
+        &self,
+        key: &[u8],
+        bit: u8,
+        start: i64,
+        end: Option<i64>,
+        end_given: bool,
+        use_bit: bool,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Str(s) => {
+                    if s.is_empty() {
+                        return if bit == 1 { Ok(-1) } else { Ok(0) };
+                    }
+                    if use_bit {
+                        let bit_len = s.len() as i64 * 8;
+                        let s_idx = if start < 0 {
+                            (bit_len + start).max(0) as usize
+                        } else {
+                            start as usize
+                        };
+                        let e_idx = match end {
+                            Some(e) => {
+                                if e < 0 {
+                                    (bit_len + e).max(0) as usize
+                                } else {
+                                    (e as usize).min(bit_len as usize - 1)
+                                }
+                            }
+                            None => bit_len as usize - 1,
+                        };
+                        if s_idx > e_idx {
+                            return Ok(-1);
+                        }
+                        for i in s_idx..=e_idx {
+                            let byte_pos = i / 8;
+                            let bit_pos = 7 - (i % 8);
+                            if byte_pos < s.len() {
+                                let b = (s[byte_pos] >> bit_pos) & 1;
+                                if b == bit {
+                                    return Ok(i as i64);
+                                }
+                            }
+                        }
+                        Ok(-1)
+                    } else {
+                        let len = s.len() as i64;
+                        let s_byte = if start < 0 {
+                            (len + start).max(0) as usize
+                        } else {
+                            (start as usize).min(len as usize)
+                        };
+                        let e_byte = match end {
+                            Some(e) => {
+                                if e < 0 {
+                                    (len + e).max(0) as usize
+                                } else {
+                                    (e as usize).min(len as usize - 1)
+                                }
+                            }
+                            None => len as usize - 1,
+                        };
+                        if s_byte > e_byte {
+                            return Ok(-1);
+                        }
+                        for i in s_byte..=e_byte {
+                            for b in 0..8u8 {
+                                let bit_val = (s[i] >> (7 - b)) & 1;
+                                if bit_val == bit {
+                                    return Ok((i * 8 + b as usize) as i64);
+                                }
+                            }
+                        }
+                        if bit == 0 && !end_given {
+                            Ok((e_byte + 1) as i64 * 8)
+                        } else {
+                            Ok(-1)
+                        }
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => {
+                if bit == 0 {
+                    Ok(0)
+                } else {
+                    Ok(-1)
+                }
+            }
+        }
+    }
+
+    pub fn bitop(
+        &self,
+        op: &str,
+        dest: &[u8],
+        keys: &[&[u8]],
+        now: Instant,
+    ) -> Result<usize, String> {
+        let mut sources: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        let mut max_len = 0usize;
+        for key in keys {
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            match shard.data.get(key_str(key)) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::Str(s) => {
+                        max_len = max_len.max(s.len());
+                        sources.push(s.to_vec());
+                    }
+                    _ => return Err(WRONGTYPE.to_string()),
+                },
+                _ => {
+                    sources.push(Vec::new());
+                }
+            }
+        }
+        if max_len == 0 {
+            self.del(&[dest]);
+            return Ok(0);
+        }
+        let mut result = vec![0u8; max_len];
+        match op {
+            "AND" => {
+                result.fill(0xff);
+                for src in &sources {
+                    for i in 0..max_len {
+                        let b = if i < src.len() { src[i] } else { 0 };
+                        result[i] &= b;
+                    }
+                }
+            }
+            "OR" => {
+                for src in &sources {
+                    for i in 0..src.len() {
+                        result[i] |= src[i];
+                    }
+                }
+            }
+            "XOR" => {
+                for src in &sources {
+                    for i in 0..src.len() {
+                        result[i] ^= src[i];
+                    }
+                }
+            }
+            "NOT" => {
+                let src = &sources[0];
+                for i in 0..max_len {
+                    result[i] = if i < src.len() { !src[i] } else { 0xff };
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "ERR BITOP requires AND, OR, XOR, or NOT, got '{op}'"
+                ));
+            }
+        }
+        let len = result.len();
+        self.set(dest, &result, None, now);
+        Ok(len)
+    }
+
     pub fn unlink(&self, keys: &[&[u8]]) -> i64 {
         self.del(keys)
     }
