@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A Redis-compatible key-value store. Up to 10x faster.</strong><br/>
-  Multi-threaded. Built-in vector search, time series, and GEO. BullMQ-compatible. Written in Rust. MIT licensed forever.
+  Multi-threaded. Built-in vector search, time series, realtime key subscriptions, and GEO. BullMQ-compatible. Written in Rust. MIT licensed forever.
 </p>
 
 <p align="center">
@@ -71,6 +71,7 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 ## Features
 
 - **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, HyperLogLog, bitops, pub/sub, transactions
+- **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
 - **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering. No extensions, no sidecars
 - **GEO commands** -- GEOADD, GEOSEARCH, GEODIST, GEOPOS, GEOHASH, GEORADIUS with up to 10x faster spatial queries
@@ -85,7 +86,7 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 - **Pipeline batching** -- consecutive same-shard commands batched under a single lock
 - **Persistence** -- automatic snapshots, configurable interval
 - **Auth** -- password authentication via `LUX_PASSWORD`
-- **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, PUBLISH
+- **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, PUBLISH, plus KSUB/KUNSUB for realtime key change events
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
 
@@ -166,6 +167,36 @@ redis-cli TSMADD cpu:host1 '*' 72.5 mem:host1 '*' 45.0 disk:host1 '*' 82.1
 
 TSGET runs at 18M ops/sec at high pipeline. Supports avg, sum, min, max, count, first, last, range, std.p, std.s, var.p, var.s aggregation functions.
 
+### Realtime Key Subscriptions (KSUB)
+
+Subscribe to key mutation events by pattern. When any client writes to a matching key, subscribers receive a realtime notification with the key name and operation. No polling, no keyspace notification config, no separate service.
+
+```bash
+# Client A: subscribe to all user key mutations
+redis-cli
+> KSUB user:*
+
+# Client B: write some data
+redis-cli
+> SET user:1 alice
+> HSET user:2 name bob
+> DEL user:1
+
+# Client A receives:
+# ["kmessage", "user:*", "user:1", "set"]
+# ["kmessage", "user:*", "user:2", "hset"]
+# ["kmessage", "user:*", "user:1", "del"]
+```
+
+Events are `["kmessage", pattern, key, operation]`. Operations are lowercase command names: `set`, `del`, `lpush`, `hset`, `zadd`, `tsadd`, etc.
+
+**How it differs from Redis keyspace notifications:**
+- Redis requires a global `notify-keyspace-events` config flag that adds overhead to every write, even if nobody is listening
+- KSUB has zero overhead when no subscribers exist (single atomic check)
+- When subscribers exist, event dispatch is fully async -- writes enqueue to a lock-free channel and a background task handles matching and delivery. The write path never blocks on subscriber fanout
+
+Built for reactive applications, cache invalidation, live dashboards, and any use case where you need to react to data changes without polling.
+
 ### SDK
 
 ```bash
@@ -240,7 +271,7 @@ rdb.Set(ctx, "hello", "world", 0)
 
 ## Testing
 
-Lux has 326 tests across unit and integration suites.
+Lux has 332 tests across unit and integration suites.
 
 ```bash
 cargo test
@@ -265,6 +296,7 @@ cargo test
 | **Integration: geo** | 14 | GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEOSEARCHSTORE, GEORADIUS, edge cases |
 | **Integration: hll** | 9 | PFADD, PFCOUNT, PFMERGE, cardinality accuracy, multi-key count, merge, WRONGTYPE |
 | **Integration: timeseries** | 18 | TSADD, TSGET, TSRANGE, TSMRANGE, TSMADD, TSINFO, aggregation, retention, labels, filtering |
+| **Integration: ksub** | 6 | KSUB event delivery, pattern filtering, multiple patterns, KUNSUB, HSET/DEL events |
 | **Valkey compat** | 10+ | Valkey multi.tcl test suite run against Lux |
 
 Run the benchmark against Redis:
@@ -306,7 +338,7 @@ Release and Docker builds only proceed after tests pass.
 
 **Time Series:** `TSADD` `TSMADD` `TSGET` `TSRANGE` `TSMRANGE` `TSINFO`
 
-**Pub/Sub:** `PUBLISH` `SUBSCRIBE` `PSUBSCRIBE` `UNSUBSCRIBE` `PUNSUBSCRIBE`
+**Pub/Sub:** `PUBLISH` `SUBSCRIBE` `PSUBSCRIBE` `UNSUBSCRIBE` `PUNSUBSCRIBE` `KSUB` `KUNSUB`
 
 **Transactions:** `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH`
 

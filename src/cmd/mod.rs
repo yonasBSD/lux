@@ -61,6 +61,12 @@ pub enum CmdResult {
         noack: bool,
         timeout: std::time::Duration,
     },
+    KSubscribe {
+        patterns: Vec<String>,
+    },
+    KUnsubscribe {
+        patterns: Vec<String>,
+    },
     Eval {
         script: String,
         keys: Vec<Vec<u8>>,
@@ -359,6 +365,12 @@ pub fn execute(
         b'K' => {
             if cmd_eq(cmd, b"KEYS") {
                 return keys::cmd_keys(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"KSUB") {
+                return pubsub::cmd_ksub(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"KUNSUB") {
+                return pubsub::cmd_kunsub(args, store, out, now);
             }
         }
         b'L' => {
@@ -1702,6 +1714,8 @@ pub fn is_known_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"BITCOUNT")
         || cmd_eq(cmd, b"BITPOS")
         || cmd_eq(cmd, b"BITOP")
+        || cmd_eq(cmd, b"KSUB")
+        || cmd_eq(cmd, b"KUNSUB")
 }
 
 pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {

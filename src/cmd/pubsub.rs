@@ -69,3 +69,24 @@ pub fn cmd_punsubscribe(
     resp::write_ok(out);
     CmdResult::Written
 }
+
+pub fn cmd_ksub(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    if args.len() < 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'ksub' command");
+        return CmdResult::Written;
+    }
+    CmdResult::KSubscribe {
+        patterns: args[1..].iter().map(|a| arg_str(a).to_string()).collect(),
+    }
+}
+
+pub fn cmd_kunsub(args: &[&[u8]], _store: &Store, _out: &mut BytesMut, _now: Instant) -> CmdResult {
+    if args.len() < 2 {
+        return CmdResult::KUnsubscribe {
+            patterns: Vec::new(),
+        };
+    }
+    CmdResult::KUnsubscribe {
+        patterns: args[1..].iter().map(|a| arg_str(a).to_string()).collect(),
+    }
+}

@@ -5,7 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
+type KeySubMap = Vec<(String, broadcast::Sender<Message>)>;
+type KeyEvent = (Box<[u8]>, Box<[u8]>);
+
 const CHANNEL_CAPACITY: usize = 1024;
+const KEY_EVENT_QUEUE_CAPACITY: usize = 65536;
 
 pub struct BlockedPopRequest {
     pub tx: mpsc::Sender<(String, Bytes)>,
@@ -17,10 +21,20 @@ pub struct BlockedPopRequest {
 pub struct Broker {
     channels: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
     pattern_subs: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
+    key_subs: Arc<parking_lot::RwLock<Arc<KeySubMap>>>,
+    key_sub_count: Arc<AtomicU64>,
+    key_event_tx: mpsc::Sender<KeyEvent>,
+    key_event_rx: Arc<parking_lot::Mutex<Option<mpsc::Receiver<KeyEvent>>>>,
     list_waiters: Arc<parking_lot::Mutex<HashMap<String, VecDeque<BlockedPopRequest>>>>,
     list_waiter_count: Arc<AtomicU64>,
     stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>>,
     waiter_counter: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MessageKind {
+    PubSub,
+    KeyEvent,
 }
 
 #[derive(Clone, Debug)]
@@ -28,13 +42,19 @@ pub struct Message {
     pub channel: String,
     pub payload: String,
     pub pattern: Option<String>,
+    pub kind: MessageKind,
 }
 
 impl Broker {
     pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel(KEY_EVENT_QUEUE_CAPACITY);
         Self {
             channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             pattern_subs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            key_subs: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
+            key_sub_count: Arc::new(AtomicU64::new(0)),
+            key_event_tx: tx,
+            key_event_rx: Arc::new(parking_lot::Mutex::new(Some(rx))),
             list_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             list_waiter_count: Arc::new(AtomicU64::new(0)),
             stream_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -156,6 +176,7 @@ impl Broker {
                     channel: channel.to_string(),
                     payload: payload.clone(),
                     pattern: None,
+                    kind: MessageKind::PubSub,
                 };
                 count += tx.send(msg).unwrap_or(0) as i64;
             }
@@ -168,6 +189,7 @@ impl Broker {
                         channel: channel.to_string(),
                         payload: payload.clone(),
                         pattern: Some(pat.clone()),
+                        kind: MessageKind::PubSub,
                     };
                     count += tx.send(msg).unwrap_or(0) as i64;
                 }
@@ -175,11 +197,88 @@ impl Broker {
         }
         count
     }
+
+    pub fn ksubscribe(&self, pattern: &str) -> broadcast::Receiver<Message> {
+        let mut subs = self.key_subs.write();
+        let inner = Arc::make_mut(&mut subs);
+        if let Some((_, tx)) = inner.iter().find(|(p, _)| p == pattern) {
+            return tx.subscribe();
+        }
+        let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
+        inner.push((pattern.to_string(), tx));
+        self.key_sub_count
+            .store(inner.len() as u64, Ordering::Release);
+        rx
+    }
+
+    pub fn kunsub(&self, pattern: &str) {
+        let mut subs = self.key_subs.write();
+        let inner = Arc::make_mut(&mut subs);
+        inner.retain(|(p, _)| p != pattern);
+        self.key_sub_count
+            .store(inner.len() as u64, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn has_key_subs(&self) -> bool {
+        self.key_sub_count.load(Ordering::Relaxed) > 0
+    }
+
+    #[inline(always)]
+    pub fn enqueue_key_event(&self, key: &[u8], cmd: &[u8]) {
+        if self.key_sub_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let _ = self.key_event_tx.try_send((key.into(), cmd.into()));
+    }
+
+    pub fn take_key_event_rx(&self) -> Option<mpsc::Receiver<KeyEvent>> {
+        self.key_event_rx.lock().take()
+    }
+
+    fn emit_key_event(subs: &[(String, broadcast::Sender<Message>)], key: &str, cmd: &[u8]) {
+        let mut op: Option<String> = None;
+        for (pat, tx) in subs.iter() {
+            if glob_match(pat, key) {
+                let operation = op.get_or_insert_with(|| {
+                    std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase()
+                });
+                let msg = Message {
+                    channel: key.to_string(),
+                    payload: operation.clone(),
+                    pattern: Some(pat.clone()),
+                    kind: MessageKind::KeyEvent,
+                };
+                let _ = tx.send(msg);
+            }
+        }
+    }
+
+    pub async fn run_key_event_loop(self) {
+        let mut rx = match self.take_key_event_rx() {
+            Some(rx) => rx,
+            None => return,
+        };
+        while let Some((key, cmd)) = rx.recv().await {
+            let snap = self.key_subs.read().clone();
+            if snap.is_empty() {
+                continue;
+            }
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                Self::emit_key_event(&snap, key_str, &cmd);
+            }
+        }
+    }
 }
 
 fn glob_match(pattern: &str, s: &str) -> bool {
     if pattern == "*" {
         return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        if !prefix.contains(['?', '[', '*']) {
+            return s.starts_with(prefix);
+        }
     }
     let p: Vec<char> = pattern.chars().collect();
     let sc: Vec<char> = s.chars().collect();
