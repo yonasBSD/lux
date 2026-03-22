@@ -3,6 +3,7 @@ mod eviction;
 mod geo;
 mod hll;
 mod hnsw;
+mod http;
 mod lua;
 mod pubsub;
 mod resp;
@@ -66,6 +67,22 @@ async fn main() -> std::io::Result<()> {
                 store.expire_sweep(now);
             }
         });
+    }
+
+    {
+        let http_port: u16 = std::env::var("LUX_HTTP_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if http_port > 0 {
+            let http_store = store.clone();
+            let http_broker = broker.clone();
+            tokio::spawn(async move {
+                if let Err(e) = http::start_http_server(http_port, http_store, http_broker).await {
+                    eprintln!("http server error: {e}");
+                }
+            });
+        }
     }
 
     println!("lux v{} ready on {addr}", env!("CARGO_PKG_VERSION"));

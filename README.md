@@ -81,6 +81,7 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 - **Lua scripting** -- EVAL, EVALSHA, SCRIPT with redis.call/pcall, cmsgpack, and cjson
 - **Redis Streams** -- XADD, XREAD, XREADGROUP, XACK, consumer groups, blocking reads
 - **Blocking commands** -- BLPOP, BRPOP, BLMOVE, BZPOPMIN, BZPOPMAX
+- **HTTP REST API** -- built-in JSON API on a separate port, 174K ops/sec, Bearer auth, CORS
 - **RESP2 protocol** -- compatible with every Redis client
 - **Multi-threaded** -- auto-tuned shards, parking_lot RwLocks, tokio async runtime
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
@@ -275,12 +276,75 @@ const sub = db.ksub(["user:*"], (event) => {
 
 Extends ioredis with typed methods for vectors, time series, and realtime key subscriptions. All standard Redis commands work as usual.
 
+### HTTP REST API
+
+Lux has a built-in HTTP/JSON API. Set `LUX_HTTP_PORT` to enable it alongside the RESP protocol. Every data primitive gets its own RESTful routes.
+
+```bash
+LUX_HTTP_PORT=8080 ./target/release/lux
+```
+
+**Key-Value:**
+```bash
+curl http://localhost:8080/v1/kv/mykey                    # GET
+curl -X PUT http://localhost:8080/v1/kv/mykey \
+  -d '{"value":"hello","ex":3600}'                        # SET (with optional TTL)
+curl -X DELETE http://localhost:8080/v1/kv/mykey           # DEL
+curl -X POST http://localhost:8080/v1/kv/counter/incr      # INCR
+curl http://localhost:8080/v1/kv/myhash/hash               # HGETALL
+curl http://localhost:8080/v1/kv/mylist/list                # LRANGE
+curl http://localhost:8080/v1/kv/myset/set                 # SMEMBERS
+curl http://localhost:8080/v1/kv/myzset/zset               # ZRANGEBYSCORE
+```
+
+**Tables:**
+```bash
+curl -X POST http://localhost:8080/v1/tables \
+  -d '{"name":"users","columns":["name:str","age:int"]}'   # TCREATE
+curl http://localhost:8080/v1/tables                        # TLIST
+curl -X POST http://localhost:8080/v1/tables/users \
+  -d '{"name":"Alice","age":"28"}'                          # TINSERT
+curl 'http://localhost:8080/v1/tables/users?where=age>25&order=name&limit=10'  # TQUERY
+curl http://localhost:8080/v1/tables/users/1                # TGET
+curl -X PUT http://localhost:8080/v1/tables/users/1 \
+  -d '{"name":"Alicia"}'                                    # TUPDATE
+curl -X DELETE http://localhost:8080/v1/tables/users/1      # TDEL
+```
+
+**Time Series:**
+```bash
+curl -X POST http://localhost:8080/v1/ts/cpu:host1 \
+  -d '{"value":72.5,"labels":{"host":"server1"}}'          # TSADD
+curl http://localhost:8080/v1/ts/cpu:host1/latest           # TSGET
+curl 'http://localhost:8080/v1/ts/cpu:host1?from=-&to=+&agg=avg&bucket=3600000'  # TSRANGE
+curl http://localhost:8080/v1/ts/cpu:host1/info             # TSINFO
+```
+
+**Vectors:**
+```bash
+curl -X POST http://localhost:8080/v1/vectors/doc:1 \
+  -d '{"vector":[0.1,0.2,0.3],"metadata":{"title":"hello"}}'  # VSET
+curl http://localhost:8080/v1/vectors/doc:1                     # VGET
+curl -X POST http://localhost:8080/v1/vectors/search \
+  -d '{"vector":[0.1,0.2,0.3],"k":5}'                         # VSEARCH
+curl http://localhost:8080/v1/vectors                            # VCARD
+```
+
+**Exec (any command):**
+```bash
+curl -X POST http://localhost:8080/v1/exec \
+  -d '{"command":["HSET","user:1","name","alice"]}'
+```
+
+Auth via `Authorization: Bearer <password>` when `LUX_PASSWORD` is set. CORS enabled by default. 174K ops/sec at 256 concurrent connections with keep-alive.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUX_PORT` | `6379` | TCP port |
-| `LUX_PASSWORD` | (none) | Enable AUTH |
+| `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable) |
+| `LUX_PASSWORD` | (none) | Enable AUTH (applies to both RESP and HTTP) |
 | `LUX_DATA_DIR` | `.` | Snapshot directory |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Shard count (default: num_cpus * 16) |
@@ -329,7 +393,7 @@ rdb.Set(ctx, "hello", "world", 0)
 
 ## Testing
 
-Lux has 349 tests across unit and integration suites.
+Lux has 363 tests across unit and integration suites.
 
 ```bash
 cargo test
@@ -355,6 +419,7 @@ cargo test
 | **Integration: hll** | 9 | PFADD, PFCOUNT, PFMERGE, cardinality accuracy, multi-key count, merge, WRONGTYPE |
 | **Integration: timeseries** | 18 | TSADD, TSGET, TSRANGE, TSMRANGE, TSMADD, TSINFO, aggregation, retention, labels, filtering |
 | **Integration: ksub** | 6 | KSUB event delivery, pattern filtering, multiple patterns, KUNSUB, HSET/DEL events |
+| **Integration: http** | 14 | HTTP REST API: health, auth, KV CRUD, tables REST, time series REST, vectors REST, data types, exec, CORS, 404 |
 | **Integration: tables** | 14 | TCREATE, TINSERT, TGET, TQUERY, TUPDATE, TDEL, TDROP, TCOUNT, TLIST, TSCHEMA, joins, foreign keys, unique constraints |
 | **Valkey compat** | 10+ | Valkey multi.tcl test suite run against Lux |
 
