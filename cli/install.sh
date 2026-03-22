@@ -21,7 +21,12 @@ case "$ARCH" in
 esac
 
 ARTIFACT="${BINARY}-${OS_NAME}-${ARCH_NAME}"
-LATEST_URL="https://github.com/${REPO}/releases/latest/download/${ARTIFACT}.tar.gz"
+LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" | grep -o '"tag_name": *"luxctl-v[^"]*"' | head -1 | grep -o 'luxctl-v[^"]*')
+if [ -z "$LATEST_TAG" ]; then
+    echo "Could not find a luxctl release. Check https://github.com/${REPO}/releases"
+    exit 1
+fi
+LATEST_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ARTIFACT}.tar.gz"
 
 echo "Installing ${BINARY} (${OS_NAME}/${ARCH_NAME})..."
 

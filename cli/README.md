@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/lux-db/lux/main/cli/install.sh | sh
 
 From source (requires Rust):
 ```bash
-cargo install --git https://github.com/lux-db/lux --path cli
+git clone https://github.com/lux-db/lux && cargo install --path lux/cli
 ```
 
 From GitHub Releases (manual download):

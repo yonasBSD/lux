@@ -229,7 +229,7 @@ Field types: `str`, `int`, `float`, `bool`, `timestamp`, `ref(table)`. Supports 
 ### CLI
 
 ```bash
-cargo install --git https://github.com/lux-db/lux --path cli
+curl -fsSL https://raw.githubusercontent.com/lux-db/lux/main/cli/install.sh | sh
 ```
 
 ```bash
