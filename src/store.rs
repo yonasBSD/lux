@@ -469,20 +469,6 @@ impl Store {
         }
     }
 
-    pub fn disk_keys(&self, _now: Instant) -> Vec<String> {
-        match &self.disk_shards {
-            Some(ds) => {
-                let mut keys = Vec::new();
-                for d in ds.iter() {
-                    let disk = d.lock();
-                    keys.extend(disk.keys().cloned());
-                }
-                keys
-            }
-            None => Vec::new(),
-        }
-    }
-
     pub fn compact_disk_shards(&self) {
         if let Some(ref ds) = self.disk_shards {
             for (i, d) in ds.iter().enumerate() {

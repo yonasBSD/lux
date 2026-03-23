@@ -393,13 +393,13 @@ impl DiskShard {
         let now = Instant::now();
 
         loop {
-            let start = self.data_file.seek(SeekFrom::Current(0))?;
+            let start = self.data_file.stream_position()?;
             if start >= file_len {
                 break;
             }
             match read_single_entry(&mut self.data_file) {
                 Ok((key, _value, ttl_ms)) => {
-                    let end_pos = self.data_file.seek(SeekFrom::Current(0))?;
+                    let end_pos = self.data_file.stream_position()?;
                     let length = (end_pos - start) as u32;
 
                     if let Some(old) = self.index.insert(
