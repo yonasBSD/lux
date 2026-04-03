@@ -144,6 +144,7 @@ fn memory_no_underflow_on_collection_delete() {
     );
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 /// Memory counter decreases when elements are popped or removed.
@@ -196,6 +197,7 @@ fn memory_tracks_collection_removals() {
     );
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 /// Memory counter does not underflow when list-only keys are deleted.
@@ -224,4 +226,5 @@ fn memory_no_underflow_list_then_del() {
     assert!(r.contains("OK"), "writes should work, got: {}", r);
 
     child.kill().ok();
+    child.wait().ok();
 }
