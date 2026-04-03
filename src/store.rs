@@ -10,6 +10,22 @@ use std::time::{Duration, Instant, SystemTime};
 pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
 pub static LRU_CLOCK: AtomicU32 = AtomicU32::new(0);
 
+/// Subtract from USED_MEMORY without underflow. Clamps to 0 instead of wrapping.
+fn mem_sub(amount: usize) {
+    USED_MEMORY
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(amount)),
+        )
+        .ok();
+}
+
+/// Add to USED_MEMORY.
+fn mem_add(amount: usize) {
+    USED_MEMORY.fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Persistence error counters. Exposed via INFO command so operators can
 /// monitor and alert on silent data-safety issues.
 pub static PERSISTENCE_ERR_WAL_APPEND: AtomicUsize = AtomicUsize::new(0);
@@ -210,6 +226,13 @@ fn key_string(key: &[u8]) -> String {
     String::from_utf8_lossy(key).into_owned()
 }
 
+fn stream_entry_memory(fields: &[(String, Bytes)]) -> usize {
+    16 + fields
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 32)
+        .sum::<usize>()
+}
+
 pub fn estimate_entry_memory(key: &str, value: &StoreValue) -> usize {
     let key_overhead = key.len() + 64;
     let val_size = match value {
@@ -232,12 +255,7 @@ pub fn estimate_entry_memory(key: &str, value: &StoreValue) -> usize {
         StoreValue::Stream(s) => s
             .entries
             .values()
-            .map(|fields| {
-                16 + fields
-                    .iter()
-                    .map(|(k, v)| k.len() + v.len() + 32)
-                    .sum::<usize>()
-            })
+            .map(|fields| stream_entry_memory(fields))
             .sum(),
     };
     key_overhead + val_size
@@ -317,6 +335,10 @@ impl Store {
         self.shards[idx].read().version
     }
 
+    pub fn is_tiered(&self) -> bool {
+        self.disk_shards.is_some()
+    }
+
     pub fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
         self.shards[idx].read()
     }
@@ -337,7 +359,7 @@ impl Store {
                     let mem = estimate_entry_memory(key, &entry.value);
                     shard.data.remove(key);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    USED_MEMORY.fetch_sub(mem, std::sync::atomic::Ordering::Relaxed);
+                    mem_sub(mem);
                     shard.version += 1;
                     return;
                 }
@@ -377,7 +399,7 @@ impl Store {
                 if let Some(entry) = shard.data.remove(key) {
                     let mem = estimate_entry_memory(key, &entry.value);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    USED_MEMORY.fetch_sub(mem, std::sync::atomic::Ordering::Relaxed);
+                    mem_sub(mem);
                     shard.version += 1;
                 }
             }
@@ -386,7 +408,7 @@ impl Store {
             if let Some(entry) = shard.data.remove(key) {
                 let mem = estimate_entry_memory(key, &entry.value);
                 shard.used_memory = shard.used_memory.saturating_sub(mem);
-                USED_MEMORY.fetch_sub(mem, std::sync::atomic::Ordering::Relaxed);
+                mem_sub(mem);
                 shard.version += 1;
             }
         }
@@ -712,7 +734,7 @@ impl Store {
                     },
                     |k| fx_hash(k.as_bytes()),
                 );
-                USED_MEMORY.fetch_add(new_size, std::sync::atomic::Ordering::Relaxed);
+                mem_add(new_size);
             }
         }
     }
@@ -807,12 +829,12 @@ impl Store {
         if let Some(old_entry) = old {
             let old_mem = estimate_entry_memory(ks, &old_entry.value);
             if mem >= old_mem {
-                USED_MEMORY.fetch_add(mem - old_mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(mem - old_mem);
             } else {
-                USED_MEMORY.fetch_sub(old_mem - mem, std::sync::atomic::Ordering::Relaxed);
+                mem_sub(old_mem - mem);
             }
         } else {
-            USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+            mem_add(mem);
         }
         true
     }
@@ -845,12 +867,12 @@ impl Store {
         if let Some(oe) = old_entry {
             let old_mem = estimate_entry_memory(ks, &oe.value);
             if mem >= old_mem {
-                USED_MEMORY.fetch_add(mem - old_mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(mem - old_mem);
             } else {
-                USED_MEMORY.fetch_sub(old_mem - mem, std::sync::atomic::Ordering::Relaxed);
+                mem_sub(old_mem - mem);
             }
         } else {
-            USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+            mem_add(mem);
         }
         old
     }
@@ -880,7 +902,7 @@ impl Store {
                 let is_vector = matches!(&entry.value, StoreValue::Vector(_));
                 let mem = estimate_entry_memory(key_str(key), &entry.value);
                 shard.used_memory = shard.used_memory.saturating_sub(mem);
-                USED_MEMORY.fetch_sub(mem, std::sync::atomic::Ordering::Relaxed);
+                mem_sub(mem);
                 if is_vector {
                     vector_keys_removed.push(key_str(key).to_string());
                 }
@@ -958,12 +980,12 @@ impl Store {
         if let Some(oe) = old_entry {
             let old_mem = estimate_entry_memory(ks, &oe.value);
             if mem >= old_mem {
-                USED_MEMORY.fetch_add(mem - old_mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(mem - old_mem);
             } else {
-                USED_MEMORY.fetch_sub(old_mem - mem, std::sync::atomic::Ordering::Relaxed);
+                mem_sub(old_mem - mem);
             }
         } else {
-            USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+            mem_add(mem);
         }
         Ok(new_val)
     }
@@ -980,7 +1002,7 @@ impl Store {
                     new_val.extend_from_slice(s);
                     new_val.extend_from_slice(value);
                     let len = new_val.len() as i64;
-                    USED_MEMORY.fetch_add(value.len(), std::sync::atomic::Ordering::Relaxed);
+                    mem_add(value.len());
                     entry.value = StoreValue::Str(Bytes::from(new_val));
                     entry.lru_clock = LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
                     return len;
@@ -1002,12 +1024,12 @@ impl Store {
         if let Some(oe) = old_entry {
             let old_mem = estimate_entry_memory(ks, &oe.value);
             if mem >= old_mem {
-                USED_MEMORY.fetch_add(mem - old_mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(mem - old_mem);
             } else {
-                USED_MEMORY.fetch_sub(old_mem - mem, std::sync::atomic::Ordering::Relaxed);
+                mem_sub(old_mem - mem);
             }
         } else {
-            USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+            mem_add(mem);
         }
         len
     }
@@ -1135,7 +1157,7 @@ impl Store {
                 Some(e) if !e.is_expired_at(now) => {
                     let mem = estimate_entry_memory(key_str(key), &e.value);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    USED_MEMORY.fetch_sub(mem, std::sync::atomic::Ordering::Relaxed);
+                    mem_sub(mem);
                     e
                 }
                 _ => return Err("ERR no such key".to_string()),
@@ -1147,7 +1169,7 @@ impl Store {
         let mem = estimate_entry_memory(key_str(new_key), &entry.value);
         shard.data.insert(key_string(new_key), entry);
         shard.used_memory += mem;
-        USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+        mem_add(mem);
         Ok(())
     }
 
@@ -1244,7 +1266,7 @@ impl Store {
             let mut shard = shard.write();
             shard.version += 1;
             shard.data.clear();
-            USED_MEMORY.fetch_sub(shard.used_memory, std::sync::atomic::Ordering::Relaxed);
+            mem_sub(shard.used_memory);
             shard.used_memory = 0;
         }
         *self.vector_index.write() = crate::hnsw::HnswIndex::new(0);
@@ -1260,6 +1282,7 @@ impl Store {
     }
 
     pub fn lpush(&self, key: &[u8], values: &[&[u8]], now: Instant) -> Result<i64, String> {
+        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -1278,13 +1301,18 @@ impl Store {
                 for v in values {
                     list.push_front(Bytes::copy_from_slice(v));
                 }
-                Ok(list.len() as i64)
+                let len = list.len() as i64;
+                let _ = entry;
+                shard.used_memory += added_mem;
+                mem_add(added_mem);
+                Ok(len)
             }
             _ => Err(WRONGTYPE.to_string()),
         }
     }
 
     pub fn rpush(&self, key: &[u8], values: &[&[u8]], now: Instant) -> Result<i64, String> {
+        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -1303,7 +1331,11 @@ impl Store {
                 for v in values {
                     list.push_back(Bytes::copy_from_slice(v));
                 }
-                Ok(list.len() as i64)
+                let len = list.len() as i64;
+                let _ = entry;
+                shard.used_memory += added_mem;
+                mem_add(added_mem);
+                Ok(len)
             }
             _ => Err(WRONGTYPE.to_string()),
         }
@@ -1315,7 +1347,13 @@ impl Store {
         shard.version += 1;
         match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
-                StoreValue::List(list) => list.pop_front(),
+                StoreValue::List(list) => {
+                    let val = list.pop_front()?;
+                    let freed = val.len() + 32;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
+                    Some(val)
+                }
                 _ => None,
             },
             _ => None,
@@ -1328,7 +1366,13 @@ impl Store {
         shard.version += 1;
         match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
-                StoreValue::List(list) => list.pop_back(),
+                StoreValue::List(list) => {
+                    let val = list.pop_back()?;
+                    let freed = val.len() + 32;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
+                    Some(val)
+                }
                 _ => None,
             },
             _ => None,
@@ -1418,13 +1462,25 @@ impl Store {
         match &mut entry.value {
             StoreValue::Hash(map) => {
                 let mut added = 0i64;
+                let mut mem_delta: isize = 0;
                 for (field, value) in pairs {
-                    if map
-                        .insert(key_string(field), Bytes::copy_from_slice(value))
-                        .is_none()
+                    let new_size = (field.len() + value.len() + 64) as isize;
+                    if let Some(old_val) =
+                        map.insert(key_string(field), Bytes::copy_from_slice(value))
                     {
+                        mem_delta += value.len() as isize - old_val.len() as isize;
+                    } else {
                         added += 1;
+                        mem_delta += new_size;
                     }
+                }
+                if mem_delta > 0 {
+                    shard.used_memory += mem_delta as usize;
+                    mem_add(mem_delta as usize);
+                } else if mem_delta < 0 {
+                    let freed = (-mem_delta) as usize;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                 }
                 Ok(added)
             }
@@ -1467,11 +1523,15 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Hash(map) => {
                     let mut removed = 0i64;
+                    let mut freed = 0usize;
                     for f in fields {
-                        if map.remove(key_str(f)).is_some() {
+                        if let Some(old_val) = map.remove(key_str(f)) {
+                            freed += f.len() + old_val.len() + 64;
                             removed += 1;
                         }
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -1565,6 +1625,10 @@ impl Store {
         match &mut entry.value {
             StoreValue::Hash(map) => {
                 let fs = key_str(field);
+                let (is_new, old_len) = match map.get(fs) {
+                    Some(v) => (false, v.len()),
+                    None => (true, 0),
+                };
                 let current: i64 = map
                     .get(fs)
                     .map(|v| {
@@ -1576,7 +1640,25 @@ impl Store {
                     .transpose()?
                     .unwrap_or(0);
                 let new_val = current + delta;
-                map.insert(fs.to_string(), Bytes::from(new_val.to_string()));
+                let new_bytes = Bytes::from(new_val.to_string());
+                let new_len = new_bytes.len();
+                map.insert(fs.to_string(), new_bytes);
+                if is_new {
+                    let added = field.len() + new_len + 64;
+                    let _ = entry;
+                    shard.used_memory += added;
+                    mem_add(added);
+                } else if new_len > old_len {
+                    let added = new_len - old_len;
+                    let _ = entry;
+                    shard.used_memory += added;
+                    mem_add(added);
+                } else if old_len > new_len {
+                    let freed = old_len - new_len;
+                    let _ = entry;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
+                }
                 Ok(new_val)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -1600,11 +1682,15 @@ impl Store {
         match &mut entry.value {
             StoreValue::Set(set) => {
                 let mut added = 0i64;
+                let mut mem_added = 0usize;
                 for m in members {
                     if set.insert(key_string(m)) {
+                        mem_added += m.len() + 32;
                         added += 1;
                     }
                 }
+                shard.used_memory += mem_added;
+                mem_add(mem_added);
                 Ok(added)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -1619,11 +1705,15 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let mut removed = 0i64;
+                    let mut freed = 0usize;
                     for m in members {
                         if set.remove(key_str(m)) {
+                            freed += m.len() + 32;
                             removed += 1;
                         }
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -1792,12 +1882,26 @@ impl Store {
                 }
 
                 stream.last_id = id;
+                let added: usize = stream_entry_memory(&fields);
                 stream.entries.insert(id, fields);
 
+                let mut trimmed_mem = 0usize;
                 if let Some(max) = maxlen {
                     while stream.entries.len() > max {
-                        stream.entries.pop_first();
+                        if let Some((_, old_fields)) = stream.entries.pop_first() {
+                            trimmed_mem += stream_entry_memory(&old_fields);
+                        }
                     }
+                }
+
+                let _ = entry;
+                if added > trimmed_mem {
+                    shard.used_memory += added - trimmed_mem;
+                    mem_add(added - trimmed_mem);
+                } else if trimmed_mem > added {
+                    let freed = trimmed_mem - added;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                 }
 
                 Ok(id)
@@ -2373,11 +2477,15 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
                     let mut removed = 0i64;
+                    let mut freed = 0usize;
                     for id in ids {
-                        if s.entries.remove(id).is_some() {
+                        if let Some(fields) = s.entries.remove(id) {
+                            freed += stream_entry_memory(&fields);
                             removed += 1;
                         }
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -2394,10 +2502,15 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
                     let mut trimmed = 0i64;
+                    let mut freed = 0usize;
                     while s.entries.len() > maxlen {
-                        s.entries.pop_first();
+                        if let Some((_, fields)) = s.entries.pop_first() {
+                            freed += stream_entry_memory(&fields);
+                        }
                         trimmed += 1;
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(trimmed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -2597,7 +2710,7 @@ impl Store {
                     },
                 );
                 shard.used_memory += mem;
-                USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(mem);
                 drop(shard);
                 self.vector_index.write().insert(key_clone, index_data);
                 return;
@@ -2622,7 +2735,7 @@ impl Store {
             },
         );
         shard.used_memory += mem;
-        USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+        mem_add(mem);
     }
 
     pub fn getdel(&self, key: &[u8], now: Instant) -> Option<Bytes> {
@@ -2632,10 +2745,16 @@ impl Store {
         let ks = key_str(key);
         match shard.data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
-                if let StoreValue::Str(s) = &entry.value {
-                    let val = s.clone();
-                    shard.data.remove(ks);
-                    Some(val)
+                if let StoreValue::Str(_) = &entry.value {
+                    let entry = shard.data.remove(ks).unwrap();
+                    let freed = estimate_entry_memory(ks, &entry.value);
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
+                    if let StoreValue::Str(s) = entry.value {
+                        Some(s)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -2716,14 +2835,22 @@ impl Store {
             entry.expires_at = None;
         }
         if let StoreValue::Str(s) = &entry.value {
+            let old_len = s.len();
             let mut buf = s.to_vec();
             let needed = offset + value.len();
             if buf.len() < needed {
                 buf.resize(needed, 0);
             }
             buf[offset..offset + value.len()].copy_from_slice(value);
-            let len = buf.len() as i64;
+            let new_len = buf.len();
+            let len = new_len as i64;
             entry.value = StoreValue::Str(Bytes::from(buf));
+            if new_len > old_len {
+                let added = new_len - old_len;
+                let _ = entry;
+                shard.used_memory += added;
+                mem_add(added);
+            }
             len
         } else {
             0
@@ -2760,10 +2887,12 @@ impl Store {
         }
         match &entry.value {
             StoreValue::Str(s) => {
+                let old_len = s.len();
                 let mut buf = s.to_vec();
                 if buf.len() <= byte_idx {
                     buf.resize(byte_idx + 1, 0);
                 }
+                let new_len = buf.len();
                 let old = (buf[byte_idx] >> bit_idx) & 1;
                 if value == 1 {
                     buf[byte_idx] |= 1 << bit_idx;
@@ -2771,6 +2900,12 @@ impl Store {
                     buf[byte_idx] &= !(1 << bit_idx);
                 }
                 entry.value = StoreValue::Str(Bytes::from(buf));
+                if new_len > old_len {
+                    let added = new_len - old_len;
+                    let _ = entry;
+                    shard.used_memory += added;
+                    mem_add(added);
+                }
                 Ok(old)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -3067,16 +3202,31 @@ impl Store {
                     ts.labels = l;
                 }
                 let pos = ts.samples.binary_search_by_key(&timestamp, |s| s.0);
+                let mut added = 0usize;
                 match pos {
                     Ok(i) => ts.samples[i].1 = value,
-                    Err(i) => ts.samples.insert(i, (timestamp, value)),
+                    Err(i) => {
+                        ts.samples.insert(i, (timestamp, value));
+                        added = 16;
+                    }
                 }
+                let mut trimmed = 0usize;
                 if ts.retention > 0 {
                     let cutoff = timestamp - ts.retention as i64;
                     let keep_from = ts.samples.partition_point(|s| s.0 < cutoff);
                     if keep_from > 0 {
+                        trimmed = keep_from * 16;
                         ts.samples.drain(..keep_from);
                     }
+                }
+                let _ = entry;
+                if added > trimmed {
+                    shard.used_memory += added - trimmed;
+                    mem_add(added - trimmed);
+                } else if trimmed > added {
+                    let freed = trimmed - added;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                 }
                 Ok(timestamp)
             }
@@ -3270,24 +3420,36 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
-            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
-                StoreValue::List(list) => {
-                    let i = if index < 0 {
-                        (list.len() as i64 + index) as usize
-                    } else {
-                        index as usize
-                    };
-                    if i >= list.len() {
-                        return Err("ERR index out of range".to_string());
+        let delta = {
+            match shard.data.get_mut(key_str(key)) {
+                Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                    StoreValue::List(list) => {
+                        let i = if index < 0 {
+                            (list.len() as i64 + index) as usize
+                        } else {
+                            index as usize
+                        };
+                        if i >= list.len() {
+                            return Err("ERR index out of range".to_string());
+                        }
+                        let old_len = list[i].len();
+                        list[i] = Bytes::copy_from_slice(value);
+                        Ok(value.len() as isize - old_len as isize)
                     }
-                    list[i] = Bytes::copy_from_slice(value);
-                    Ok(())
-                }
-                _ => Err(WRONGTYPE.to_string()),
-            },
-            _ => Err("ERR no such key".to_string()),
+                    _ => Err(WRONGTYPE.to_string()),
+                },
+                _ => Err("ERR no such key".to_string()),
+            }
+        }?;
+        if delta > 0 {
+            shard.used_memory += delta as usize;
+            mem_add(delta as usize);
+        } else if delta < 0 {
+            let freed = (-delta) as usize;
+            shard.used_memory = shard.used_memory.saturating_sub(freed);
+            mem_sub(freed);
         }
+        Ok(())
     }
 
     pub fn linsert(
@@ -3306,8 +3468,13 @@ impl Store {
                 StoreValue::List(list) => {
                     if let Some(pos) = list.iter().position(|v| v.as_ref() == pivot) {
                         let insert_at = if before { pos } else { pos + 1 };
+                        let added = value.len() + 32;
                         list.insert(insert_at, Bytes::copy_from_slice(value));
-                        Ok(list.len() as i64)
+                        let len = list.len() as i64;
+                        let _ = entry;
+                        shard.used_memory += added;
+                        mem_add(added);
+                        Ok(len)
                     } else {
                         Ok(-1)
                     }
@@ -3326,6 +3493,7 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let mut removed = 0i64;
+                    let elem_size = value.len() + 32;
                     if count > 0 {
                         let mut i = 0;
                         while i < list.len() && removed < count {
@@ -3355,6 +3523,9 @@ impl Store {
                             }
                         });
                     }
+                    let freed = removed as usize * elem_size;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -3381,11 +3552,18 @@ impl Store {
                     } else {
                         (stop + 1).min(len) as usize
                     };
+                    let before_size: usize = list.iter().map(|b| b.len() + 32).sum();
                     if s >= e {
                         list.clear();
                     } else {
                         let trimmed: VecDeque<Bytes> = list.drain(s..e).collect();
                         *list = trimmed;
+                    }
+                    let after_size: usize = list.iter().map(|b| b.len() + 32).sum();
+                    if before_size > after_size {
+                        let freed = before_size - after_size;
+                        shard.used_memory = shard.used_memory.saturating_sub(freed);
+                        mem_sub(freed);
                     }
                     Ok(())
                 }
@@ -3396,38 +3574,54 @@ impl Store {
     }
 
     pub fn lpushx(&self, key: &[u8], values: &[&[u8]], now: Instant) -> i64 {
+        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        let result = match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     for v in values {
                         list.push_front(Bytes::copy_from_slice(v));
                     }
-                    list.len() as i64
+                    Some(list.len() as i64)
                 }
-                _ => 0,
+                _ => None,
             },
-            _ => 0,
+            _ => None,
+        };
+        if let Some(len) = result {
+            shard.used_memory += added_mem;
+            mem_add(added_mem);
+            len
+        } else {
+            0
         }
     }
 
     pub fn rpushx(&self, key: &[u8], values: &[&[u8]], now: Instant) -> i64 {
+        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        let result = match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     for v in values {
                         list.push_back(Bytes::copy_from_slice(v));
                     }
-                    list.len() as i64
+                    Some(list.len() as i64)
                 }
-                _ => 0,
+                _ => None,
             },
-            _ => 0,
+            _ => None,
+        };
+        if let Some(len) = result {
+            shard.used_memory += added_mem;
+            mem_add(added_mem);
+            len
+        } else {
+            0
         }
     }
 
@@ -3446,11 +3640,17 @@ impl Store {
             match shard.data.get_mut(key_str(src)) {
                 Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                     StoreValue::List(list) => {
-                        if from_left {
+                        let v = if from_left {
                             list.pop_front()
                         } else {
                             list.pop_back()
+                        };
+                        if let Some(ref val) = v {
+                            let freed = val.len() + 32;
+                            shard.used_memory = shard.used_memory.saturating_sub(freed);
+                            mem_sub(freed);
                         }
+                        v
                     }
                     _ => None,
                 },
@@ -3472,11 +3672,14 @@ impl Store {
                 entry.expires_at = None;
             }
             if let StoreValue::List(list) = &mut entry.value {
+                let added = v.len() + 32;
                 if to_left {
                     list.push_front(v.clone());
                 } else {
                     list.push_back(v.clone());
                 }
+                shard.used_memory += added;
+                mem_add(added);
             }
         }
         val
@@ -3508,7 +3711,10 @@ impl Store {
                 if map.contains_key(fs) {
                     Ok(false)
                 } else {
+                    let added = field.len() + value.len() + 64;
                     map.insert(fs.to_string(), Bytes::copy_from_slice(value));
+                    shard.used_memory += added;
+                    mem_add(added);
                     Ok(true)
                 }
             }
@@ -3539,6 +3745,10 @@ impl Store {
         match &mut entry.value {
             StoreValue::Hash(map) => {
                 let fs = key_str(field);
+                let (is_new, old_len) = match map.get(fs) {
+                    Some(v) => (false, v.len()),
+                    None => (true, 0),
+                };
                 let current: f64 = map
                     .get(fs)
                     .map(|v| {
@@ -3551,7 +3761,24 @@ impl Store {
                     .unwrap_or(0.0);
                 let new_val = current + delta;
                 let s = format!("{}", new_val);
+                let new_len = s.len();
                 map.insert(fs.to_string(), Bytes::from(s.clone()));
+                if is_new {
+                    let added = field.len() + new_len + 64;
+                    let _ = entry;
+                    shard.used_memory += added;
+                    mem_add(added);
+                } else if new_len > old_len {
+                    let added = new_len - old_len;
+                    let _ = entry;
+                    shard.used_memory += added;
+                    mem_add(added);
+                } else if old_len > new_len {
+                    let freed = old_len - new_len;
+                    let _ = entry;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
+                }
                 Ok(s)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -3580,14 +3807,18 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let mut result = Vec::new();
+                    let mut freed = 0usize;
                     for _ in 0..count {
                         if set.is_empty() {
                             break;
                         }
                         let member = set.iter().next().unwrap().clone();
+                        freed += member.len() + 32;
                         set.remove(&member);
                         result.push(member);
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -3627,13 +3858,21 @@ impl Store {
         member: &[u8],
         now: Instant,
     ) -> Result<bool, String> {
+        let mem_size = member.len() + 32;
         let src_idx = self.shard_index(src);
         let removed = {
             let mut shard = self.shards[src_idx].write();
             shard.version += 1;
             match shard.data.get_mut(key_str(src)) {
                 Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
-                    StoreValue::Set(set) => set.remove(key_str(member)),
+                    StoreValue::Set(set) => {
+                        let r = set.remove(key_str(member));
+                        if r {
+                            shard.used_memory = shard.used_memory.saturating_sub(mem_size);
+                            mem_sub(mem_size);
+                        }
+                        r
+                    }
                     _ => return Err(WRONGTYPE.to_string()),
                 },
                 _ => false,
@@ -3657,7 +3896,11 @@ impl Store {
         }
         match &mut entry.value {
             StoreValue::Set(set) => {
-                set.insert(key_string(member));
+                if set.insert(key_string(member)) {
+                    let _ = entry;
+                    shard.used_memory += mem_size;
+                    mem_add(mem_size);
+                }
                 Ok(true)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -3741,6 +3984,7 @@ impl Store {
             StoreValue::SortedSet(tree, scores) => {
                 let mut added = 0i64;
                 let mut changed = 0i64;
+                let mut mem_added = 0usize;
                 for &(member, score) in members {
                     let ms = key_string(member);
                     if let Some(&old_score) = scores.get(&ms) {
@@ -3768,9 +4012,12 @@ impl Store {
                         }
                         tree.insert((OrderedFloat(score), ms.clone()), ());
                         scores.insert(ms, score);
+                        mem_added += member.len() + 48;
                         added += 1;
                     }
                 }
+                shard.used_memory += mem_added;
+                mem_add(mem_added);
                 Ok(if ch { added + changed } else { added })
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -3829,13 +4076,17 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     let mut removed = 0i64;
+                    let mut freed = 0usize;
                     for m in members {
                         let ms = key_str(m);
                         if let Some(score) = scores.remove(ms) {
                             tree.remove(&(OrderedFloat(score), ms.to_string()));
+                            freed += m.len() + 48;
                             removed += 1;
                         }
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -4046,14 +4297,18 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     let mut result = Vec::new();
+                    let mut freed = 0usize;
                     for _ in 0..count {
                         if let Some(((score, member), _)) = tree.pop_first() {
+                            freed += member.len() + 48;
                             scores.remove(&member);
                             result.push((member, score.0));
                         } else {
                             break;
                         }
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -4075,14 +4330,18 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     let mut result = Vec::new();
+                    let mut freed = 0usize;
                     for _ in 0..count {
                         if let Some(((score, member), _)) = tree.pop_last() {
+                            freed += member.len() + 48;
                             scores.remove(&member);
                             result.push((member, score.0));
                         } else {
                             break;
                         }
                     }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -4133,7 +4392,9 @@ impl Store {
             shard.version += 1;
             let mut tree = BTreeMap::new();
             let mut scores = HashMap::new();
+            let mut mem = key_str(dst).len() + 64;
             for (member, score) in result {
+                mem += member.len() + 48;
                 tree.insert((OrderedFloat(score), member.clone()), ());
                 scores.insert(member, score);
             }
@@ -4145,6 +4406,8 @@ impl Store {
                     lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
                 },
             );
+            shard.used_memory += mem;
+            mem_add(mem);
         }
         Ok(count)
     }
@@ -4190,7 +4453,9 @@ impl Store {
             shard.version += 1;
             let mut tree = BTreeMap::new();
             let mut scores = HashMap::new();
+            let mut mem = key_str(dst).len() + 64;
             for (member, score) in result {
+                mem += member.len() + 48;
                 tree.insert((OrderedFloat(score), member.clone()), ());
                 scores.insert(member, score);
             }
@@ -4202,6 +4467,8 @@ impl Store {
                     lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
                 },
             );
+            shard.used_memory += mem;
+            mem_add(mem);
         }
         Ok(count)
     }
@@ -4224,7 +4491,9 @@ impl Store {
             shard.version += 1;
             let mut tree = BTreeMap::new();
             let mut scores = HashMap::new();
+            let mut mem = key_str(dst).len() + 64;
             for (member, score) in result {
+                mem += member.len() + 48;
                 tree.insert((OrderedFloat(score), member.clone()), ());
                 scores.insert(member, score);
             }
@@ -4236,6 +4505,8 @@ impl Store {
                     lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
                 },
             );
+            shard.used_memory += mem;
+            mem_add(mem);
         }
         Ok(count)
     }
@@ -4350,7 +4621,7 @@ impl Store {
                         let is_vector = matches!(&entry.value, StoreValue::Vector(_));
                         let mem = estimate_entry_memory(&key, &entry.value);
                         shard.used_memory = shard.used_memory.saturating_sub(mem);
-                        USED_MEMORY.fetch_sub(mem, std::sync::atomic::Ordering::Relaxed);
+                        mem_sub(mem);
                         if is_vector {
                             expired_vectors.push(key);
                         }
@@ -4394,11 +4665,11 @@ impl Store {
                 if new_mem > old_mem {
                     let diff = new_mem - old_mem;
                     shard.used_memory += diff;
-                    USED_MEMORY.fetch_add(diff, std::sync::atomic::Ordering::Relaxed);
+                    mem_add(diff);
                 } else {
                     let diff = old_mem - new_mem;
                     shard.used_memory = shard.used_memory.saturating_sub(diff);
-                    USED_MEMORY.fetch_sub(diff, std::sync::atomic::Ordering::Relaxed);
+                    mem_sub(diff);
                 }
                 Ok(if changed { 1 } else { 0 })
             }
@@ -4438,7 +4709,7 @@ impl Store {
                     },
                 );
                 shard.used_memory += mem;
-                USED_MEMORY.fetch_add(mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(mem);
                 Ok(if changed { 1 } else { 0 })
             }
         }
@@ -4520,15 +4791,15 @@ impl Store {
                 if new_mem > old_mem {
                     let diff = new_mem - old_mem;
                     shard.used_memory += diff;
-                    USED_MEMORY.fetch_add(diff, std::sync::atomic::Ordering::Relaxed);
+                    mem_add(diff);
                 } else {
                     let diff = old_mem - new_mem;
                     shard.used_memory = shard.used_memory.saturating_sub(diff);
-                    USED_MEMORY.fetch_sub(diff, std::sync::atomic::Ordering::Relaxed);
+                    mem_sub(diff);
                 }
             } else {
                 shard.used_memory += new_mem;
-                USED_MEMORY.fetch_add(new_mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(new_mem);
             }
             shard.data.insert(
                 key_string(dest),
@@ -4574,13 +4845,13 @@ impl Store {
         ) {
             let old_mem = estimate_entry_memory(&ks, &old.value);
             if new_mem >= old_mem {
-                USED_MEMORY.fetch_add(new_mem - old_mem, std::sync::atomic::Ordering::Relaxed);
+                mem_add(new_mem - old_mem);
             } else {
-                USED_MEMORY.fetch_sub(old_mem - new_mem, std::sync::atomic::Ordering::Relaxed);
+                mem_sub(old_mem - new_mem);
             }
             shard.used_memory = shard.used_memory.saturating_sub(old_mem) + new_mem;
         } else {
-            USED_MEMORY.fetch_add(new_mem, std::sync::atomic::Ordering::Relaxed);
+            mem_add(new_mem);
             shard.used_memory += new_mem;
         }
         drop(shard);

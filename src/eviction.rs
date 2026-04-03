@@ -84,11 +84,16 @@ pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
 
     let cfg = eviction_config();
     let max = cfg.max_memory;
+    let tiered = store.is_tiered();
 
     let mut iterations = 0;
     while USED_MEMORY.load(Ordering::Relaxed) > max {
         iterations += 1;
         if iterations > 128 {
+            if tiered {
+                // In tiered mode, data spills to disk. Never reject writes.
+                return Ok(());
+            }
             return Err("OOM command not allowed when used memory > 'maxmemory'");
         }
 
@@ -101,6 +106,9 @@ pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
         };
 
         if !evicted {
+            if tiered {
+                return Ok(());
+            }
             return Err("OOM command not allowed when used memory > 'maxmemory'");
         }
     }
@@ -280,7 +288,6 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"ZREMRANGEBYRANK")
         || eq(cmd, b"ZREMRANGEBYSCORE")
         || eq(cmd, b"ZREMRANGEBYLEX")
-        || eq(cmd, b"TSMADD")
 }
 
 #[cfg(test)]
