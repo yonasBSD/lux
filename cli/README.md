@@ -59,6 +59,10 @@ luxctl logs my-app -l 500                     # fetch 500 lines
 luxctl restart my-app                         # restart instance
 luxctl destroy my-app --accept-consequences   # permanently delete
 luxctl connect my-app                         # interactive REPL via Lux Cloud
+luxctl migrate new create_users               # create a migration file
+luxctl migrate status                         # check status (local instance)
+luxctl migrate run                            # run pending migrations (local instance)
+luxctl migrate run my-app                     # run against a cloud project
 ```
 
 ## Local Connections
@@ -70,6 +74,29 @@ luxctl connect redis://localhost:6379
 luxctl connect lux://:password@localhost:6379
 luxctl connect -H localhost -p 6379 -a mypassword
 ```
+
+## Migrations
+
+Manage schema changes with versioned `.lux` files:
+
+```bash
+# Create a new migration
+luxctl migrate new create_users
+# Creates lux/migrations/{timestamp}_create_users.lux
+
+# Check migration status (defaults to localhost:6379)
+luxctl migrate status
+luxctl migrate status my-app              # cloud project
+luxctl migrate status --host 10.0.0.5     # specific host
+
+# Run all pending migrations
+luxctl migrate run                               # local instance
+luxctl migrate run my-app                        # cloud project
+luxctl migrate run lux://:pass@myhost:6379       # connection string
+luxctl migrate run --host 10.0.0.5 --port 6379   # specific host
+```
+
+Migration files contain Lux commands (one per line). Lines starting with `#` or `--` are comments. Applied migrations are tracked in a `__migrations` table on your project.
 
 ## Environment Variables
 
