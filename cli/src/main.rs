@@ -65,7 +65,7 @@ enum Commands {
         accept_consequences: bool,
     },
     Connect {
-        #[arg(help = "Project name, ID, or connection URL (redis://...)")]
+        #[arg(help = "Project name, ID, or connection URL (lux://...)")]
         project: Option<String>,
         #[arg(short = 'H', long, help = "Host (for direct connection)")]
         host: Option<String>,
@@ -346,7 +346,7 @@ async fn main() {
             println!("{} {}MB", "Memory:".bold(), inst.memory_mb);
 
             if let (Some(host), Some(port)) = (&inst.worker_host, inst.port) {
-                println!("{} redis://:****@{host}:{port}", "Connection:".bold());
+                println!("{} lux://:****@{host}:{port}", "Connection:".bold());
             }
 
             if inst.status == "running" {
@@ -605,10 +605,10 @@ async fn main() {
         } => {
             let project = project.unwrap_or_default();
             let (conn_host, conn_port, conn_pass, conn_name) =
-                if project.starts_with("redis://") || project.starts_with("lux://") {
+                if project.starts_with("lux://") || project.starts_with("redis://") {
                     let url = project
-                        .trim_start_matches("redis://")
-                        .trim_start_matches("lux://");
+                        .trim_start_matches("lux://")
+                        .trim_start_matches("redis://");
                     let (auth, hostport) = if let Some(at) = url.find('@') {
                         (
                             Some(url[..at].trim_start_matches(':').to_string()),
@@ -1310,7 +1310,7 @@ async fn resolve_migrate_target(
     };
 
     // Check if it's a connection URL
-    if project.starts_with("redis://") || project.starts_with("lux://") {
+    if project.starts_with("lux://") || project.starts_with("redis://") {
         let url = project
             .trim_start_matches("redis://")
             .trim_start_matches("lux://");

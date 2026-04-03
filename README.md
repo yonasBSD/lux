@@ -99,7 +99,9 @@ cargo build --release
 ./target/release/lux
 ```
 
-Lux starts on `0.0.0.0:6379` by default. Connect with any Redis client:
+Lux starts on `0.0.0.0:6379` by default. Connect with any Redis client using `lux://` or `redis://`:
+
+> **Protocol note:** `lux://` is the primary protocol for the Lux SDK and luxctl CLI. When using third-party Redis clients (ioredis, redis-py, go-redis) directly, use `redis://` since they don't recognize `lux://`. Both connect to the same server.
 
 ```bash
 redis-cli
@@ -256,7 +258,7 @@ bun i @luxdb/sdk
 ```typescript
 import { Lux } from "@luxdb/sdk"
 
-const db = new Lux("redis://localhost:6379")
+const db = new Lux("lux://localhost:6379")
 
 await db.set("hello", "world")
 
@@ -364,7 +366,7 @@ bun i @luxdb/sdk   # or: bun i ioredis
 ```typescript
 import { Lux } from "@luxdb/sdk"
 
-const db = new Lux("redis://localhost:6379")
+const db = new Lux("lux://localhost:6379")
 await db.set("hello", "world")
 await db.vset("doc:1", [0.1, 0.2, 0.3], { metadata: { title: "hello" } })
 const results = await db.vsearch([0.1, 0.2, 0.3], { k: 5, meta: true })

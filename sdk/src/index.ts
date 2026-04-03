@@ -176,6 +176,12 @@ export class Lux extends Redis {
 	timeseries: TimeSeriesNamespace;
 
 	constructor(options?: RedisOptions | string) {
+		if (typeof options === 'string') {
+			if (options.startsWith('rediss://') || options.startsWith('luxs://')) {
+				throw new Error('TLS is not yet supported');
+			}
+			options = options.replace(/^lux:\/\//, 'redis://');
+		}
 		super(options as any);
 		this.vectors = new VectorNamespace(this);
 		this.timeseries = new TimeSeriesNamespace(this);

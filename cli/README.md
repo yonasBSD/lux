@@ -70,7 +70,7 @@ luxctl migrate run my-app                     # run against a cloud project
 Connect directly to any Lux or Redis instance without going through the cloud API:
 
 ```bash
-luxctl connect redis://localhost:6379
+luxctl connect lux://localhost:6379
 luxctl connect lux://:password@localhost:6379
 luxctl connect -H localhost -p 6379 -a mypassword
 ```
