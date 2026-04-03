@@ -1110,7 +1110,19 @@ fn resp_read_line(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
     Ok(line.trim_end().to_string())
 }
 
+const RESP_MAX_DEPTH: u8 = 8;
+
 fn resp_read_response(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+    resp_read_response_inner(reader, 0)
+}
+
+fn resp_read_response_inner(
+    reader: &mut BufReader<TcpStream>,
+    depth: u8,
+) -> Result<String, String> {
+    if depth > RESP_MAX_DEPTH {
+        return Err("RESP nesting too deep".to_string());
+    }
     let line = resp_read_line(reader)?;
     if line.is_empty() {
         return Err("empty response".to_string());
@@ -1145,7 +1157,7 @@ fn resp_read_response(reader: &mut BufReader<TcpStream>) -> Result<String, Strin
             }
             let mut lines = Vec::new();
             for i in 0..count {
-                let elem = resp_read_response(reader)?;
+                let elem = resp_read_response_inner(reader, depth + 1)?;
                 lines.push(format!("{}) {elem}", i + 1));
             }
             Ok(lines.join("\n"))
