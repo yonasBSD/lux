@@ -91,12 +91,24 @@ enum MigrateAction {
         name: String,
     },
     Status {
-        #[arg(help = "Project name or ID")]
-        project: String,
+        #[arg(help = "Project name, ID, or connection URL")]
+        project: Option<String>,
+        #[arg(short = 'H', long, help = "Host for direct connection")]
+        host: Option<String>,
+        #[arg(short, long, help = "Port for direct connection")]
+        port: Option<u16>,
+        #[arg(short = 'a', long, help = "Password for direct connection")]
+        password: Option<String>,
     },
     Run {
-        #[arg(help = "Project name or ID")]
-        project: String,
+        #[arg(help = "Project name, ID, or connection URL")]
+        project: Option<String>,
+        #[arg(short = 'H', long, help = "Host for direct connection")]
+        host: Option<String>,
+        #[arg(short, long, help = "Port for direct connection")]
+        port: Option<u16>,
+        #[arg(short = 'a', long, help = "Password for direct connection")]
+        password: Option<String>,
     },
 }
 
@@ -915,11 +927,22 @@ async fn main() {
                 println!("{} {}", "Created:".green(), path.display());
             }
 
-            MigrateAction::Status { project } => {
-                let (client, api_url, token) = get_client(&api_url_override);
-                let inst = find_project(&client, &api_url, &token, &project).await;
+            MigrateAction::Status {
+                project,
+                host,
+                port,
+                password,
+            } => {
+                let mut target = resolve_migrate_target(
+                    project.as_deref(),
+                    host.as_deref(),
+                    port,
+                    password.as_deref(),
+                    &api_url_override,
+                )
+                .await;
 
-                let applied = get_applied_migrations(&client, &api_url, &token, &inst.id).await;
+                let applied = get_applied_migrations(&mut target).await;
                 let local = get_local_migrations();
 
                 if local.is_empty() {
@@ -938,13 +961,24 @@ async fn main() {
                 }
             }
 
-            MigrateAction::Run { project } => {
-                let (client, api_url, token) = get_client(&api_url_override);
-                let inst = find_project(&client, &api_url, &token, &project).await;
+            MigrateAction::Run {
+                project,
+                host,
+                port,
+                password,
+            } => {
+                let mut target = resolve_migrate_target(
+                    project.as_deref(),
+                    host.as_deref(),
+                    port,
+                    password.as_deref(),
+                    &api_url_override,
+                )
+                .await;
 
-                ensure_migrations_table(&client, &api_url, &token, &inst.id).await;
+                ensure_migrations_table(&mut target).await;
 
-                let applied = get_applied_migrations(&client, &api_url, &token, &inst.id).await;
+                let applied = get_applied_migrations(&mut target).await;
                 let local = get_local_migrations();
 
                 let pending: Vec<_> = local
@@ -975,15 +1009,12 @@ async fn main() {
 
                     let mut failed = false;
                     for line in &lines {
-                        let res = exec_command(&client, &api_url, &token, &inst.id, line).await;
-                        if let Some(err) = res {
-                            if err.starts_with("ERR") || err.starts_with("-") {
-                                println!(" {}", "FAILED".red());
-                                eprintln!("    {} {}", "Command:".dimmed(), line);
-                                eprintln!("    {} {}", "Error:".red(), err);
-                                failed = true;
-                                break;
-                            }
+                        if let Err(e) = target.exec(line).await {
+                            println!(" {}", "FAILED".red());
+                            eprintln!("    {} {}", "Command:".dimmed(), line);
+                            eprintln!("    {} {}", "Error:".red(), e);
+                            failed = true;
+                            break;
                         }
                     }
 
@@ -1002,7 +1033,11 @@ async fn main() {
                         checksum,
                         chrono::Utc::now().timestamp()
                     );
-                    exec_command(&client, &api_url, &token, &inst.id, &record_cmd).await;
+                    if let Err(e) = target.exec(&record_cmd).await {
+                        println!(" {}", "FAILED".red());
+                        eprintln!("    {} Failed to record migration: {}", "Error:".red(), e);
+                        std::process::exit(1);
+                    }
 
                     println!(" {}", "OK".green());
                 }
@@ -1023,69 +1058,343 @@ async fn exec_command(
     token: &str,
     instance_id: &str,
     command: &str,
-) -> Option<String> {
+) -> Result<String, String> {
     let res = client
         .post(format!("{api_url}/console/{instance_id}/exec"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({ "command": command }))
         .send()
         .await
-        .ok()?;
+        .map_err(|e| format!("request failed: {e}"))?;
 
-    let body: serde_json::Value = res.json().await.ok()?;
+    let status = res.status();
+    let body: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
+
     if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
-        return Some(err.to_string());
+        return Err(err.to_string());
     }
-    body.get("output")
+
+    let output = body
+        .get("output")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .unwrap_or("")
+        .to_string();
+
+    if output.starts_with("(error)") {
+        return Err(output);
+    }
+
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+
+    Ok(output)
 }
 
-async fn ensure_migrations_table(
-    client: &reqwest::Client,
-    api_url: &str,
-    token: &str,
-    instance_id: &str,
-) {
-    let check = exec_command(client, api_url, token, instance_id, "TSCHEMA __migrations").await;
-    if check.is_none()
-        || check.as_deref() == Some("")
-        || check.as_deref().unwrap_or("").contains("ERR")
-    {
-        exec_command(
-            client,
-            api_url,
-            token,
-            instance_id,
-            "TCREATE __migrations filename:str checksum:str applied_at:int",
-        )
-        .await;
+fn resp_encode(args: &[&str]) -> Vec<u8> {
+    let mut cmd = format!("*{}\r\n", args.len());
+    for a in args {
+        cmd.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+    }
+    cmd.into_bytes()
+}
+
+fn resp_read_line(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read error: {e}"))?;
+    Ok(line.trim_end().to_string())
+}
+
+fn resp_read_response(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+    let line = resp_read_line(reader)?;
+    if line.is_empty() {
+        return Err("empty response".to_string());
+    }
+    let prefix = line.as_bytes()[0];
+    let rest = &line[1..];
+
+    match prefix {
+        b'+' => Ok(rest.to_string()),
+        b'-' => Err(rest.to_string()),
+        b':' => Ok(format!("(integer) {rest}")),
+        b'$' => {
+            let len: i64 = rest
+                .parse()
+                .map_err(|_| "invalid bulk length".to_string())?;
+            if len < 0 {
+                return Ok("(nil)".to_string());
+            }
+            let mut buf = vec![0u8; (len + 2) as usize];
+            use std::io::Read;
+            reader
+                .read_exact(&mut buf)
+                .map_err(|e| format!("read error: {e}"))?;
+            Ok(String::from_utf8_lossy(&buf[..len as usize]).to_string())
+        }
+        b'*' => {
+            let count: i64 = rest
+                .parse()
+                .map_err(|_| "invalid array length".to_string())?;
+            if count < 0 {
+                return Ok("(empty array)".to_string());
+            }
+            let mut lines = Vec::new();
+            for i in 0..count {
+                let elem = resp_read_response(reader)?;
+                lines.push(format!("{}) {elem}", i + 1));
+            }
+            Ok(lines.join("\n"))
+        }
+        _ => Ok(line),
     }
 }
 
-async fn get_applied_migrations(
-    client: &reqwest::Client,
-    api_url: &str,
-    token: &str,
-    instance_id: &str,
-) -> std::collections::HashSet<String> {
-    let mut applied = std::collections::HashSet::new();
-    let result = exec_command(
+struct DirectConn {
+    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+}
+
+impl DirectConn {
+    fn connect(host: &str, port: u16, password: &str) -> Result<Self, String> {
+        let stream = TcpStream::connect(format!("{host}:{port}"))
+            .map_err(|e| format!("connection failed: {e}"))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut conn = DirectConn { stream, reader };
+
+        if !password.is_empty() {
+            let result = conn.exec(&format!("AUTH {password}"));
+            if let Err(e) = result {
+                return Err(format!("authentication failed: {e}"));
+            }
+        }
+        Ok(conn)
+    }
+
+    fn exec(&mut self, command: &str) -> Result<String, String> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err("empty command".to_string());
+        }
+        self.stream
+            .write_all(&resp_encode(&parts))
+            .map_err(|e| format!("write error: {e}"))?;
+        resp_read_response(&mut self.reader)
+    }
+
+    /// Execute TQUERY and return rows as Vec<Vec<String>> (each row is [id, field, val, ...])
+    fn exec_tquery(&mut self, command: &str) -> Result<Vec<Vec<String>>, String> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        self.stream
+            .write_all(&resp_encode(&parts))
+            .map_err(|e| format!("write error: {e}"))?;
+
+        // Read outer array (rows)
+        let header = resp_read_line(&mut self.reader)?;
+        if let Some(err) = header.strip_prefix('-') {
+            return Err(err.to_string());
+        }
+        let row_count: i64 = header
+            .strip_prefix('*')
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if row_count <= 0 {
+            return Ok(vec![]);
+        }
+
+        let mut rows = Vec::new();
+        for _ in 0..row_count {
+            // Read inner array (row fields)
+            let row_header = resp_read_line(&mut self.reader)?;
+            let field_count: i64 = row_header
+                .strip_prefix('*')
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let mut fields = Vec::new();
+            for _ in 0..field_count {
+                let val = resp_read_response(&mut self.reader)?;
+                // Strip "(integer) " prefix from integer values
+                let val = val.strip_prefix("(integer) ").unwrap_or(&val).to_string();
+                fields.push(val);
+            }
+            rows.push(fields);
+        }
+        Ok(rows)
+    }
+}
+
+enum MigrateTarget {
+    Cloud {
+        client: reqwest::Client,
+        api_url: String,
+        token: String,
+        instance_id: String,
+    },
+    Direct(DirectConn),
+}
+
+impl MigrateTarget {
+    async fn exec(&mut self, command: &str) -> Result<String, String> {
+        match self {
+            MigrateTarget::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => exec_command(client, api_url, token, instance_id, command).await,
+            MigrateTarget::Direct(conn) => conn.exec(command),
+        }
+    }
+}
+
+async fn resolve_migrate_target(
+    project: Option<&str>,
+    host: Option<&str>,
+    port: Option<u16>,
+    password: Option<&str>,
+    api_url_override: &Option<String>,
+) -> MigrateTarget {
+    if host.is_some() || port.is_some() {
+        let h = host.unwrap_or("localhost");
+        let p = port.unwrap_or(6379);
+        let pw = password.unwrap_or("");
+        match DirectConn::connect(h, p, pw) {
+            Ok(conn) => return MigrateTarget::Direct(conn),
+            Err(e) => {
+                eprintln!("{} {}", "Error:".red(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let project = match project {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            // No project and no host/port: default to localhost
+            match DirectConn::connect("localhost", 6379, password.unwrap_or("")) {
+                Ok(conn) => return MigrateTarget::Direct(conn),
+                Err(e) => {
+                    eprintln!(
+                        "{} No project specified and local connection failed: {}",
+                        "Error:".red(),
+                        e
+                    );
+                    eprintln!(
+                        "Usage: {} or {}",
+                        "luxctl migrate run <project>".bold(),
+                        "luxctl migrate run --host <host> --port <port>".bold()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    // Check if it's a connection URL
+    if project.starts_with("redis://") || project.starts_with("lux://") {
+        let url = project
+            .trim_start_matches("redis://")
+            .trim_start_matches("lux://");
+        let (auth, hostport) = if let Some(at) = url.find('@') {
+            (
+                Some(url[..at].trim_start_matches(':').to_string()),
+                &url[at + 1..],
+            )
+        } else {
+            (None, url)
+        };
+        let parts: Vec<&str> = hostport.split(':').collect();
+        let h = parts[0];
+        let p: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(6379);
+        let pw = auth.unwrap_or_default();
+        match DirectConn::connect(h, p, &pw) {
+            Ok(conn) => return MigrateTarget::Direct(conn),
+            Err(e) => {
+                eprintln!("{} {}", "Error:".red(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Cloud project
+    let (client, api_url, token) = get_client(api_url_override);
+    let inst = find_project(&client, &api_url, &token, project).await;
+    MigrateTarget::Cloud {
         client,
         api_url,
         token,
-        instance_id,
-        "TQUERY __migrations ORDER BY id ASC LIMIT 1000",
-    )
-    .await;
+        instance_id: inst.id,
+    }
+}
 
-    if let Some(output) = result {
-        for line in output.lines() {
-            if let Some(pos) = line.find("filename") {
-                let rest = &line[pos + 8..];
-                let name = rest.split_whitespace().next().unwrap_or("");
-                if !name.is_empty() {
-                    applied.insert(name.to_string());
+async fn ensure_migrations_table(target: &mut MigrateTarget) {
+    let needs_create = target.exec("TSCHEMA __migrations").await.is_err();
+    if needs_create {
+        if let Err(e) = target
+            .exec("TCREATE __migrations filename:str checksum:str applied_at:int")
+            .await
+        {
+            eprintln!(
+                "{} Failed to create __migrations table: {}",
+                "Error:".red(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn get_applied_migrations(target: &mut MigrateTarget) -> std::collections::HashSet<String> {
+    let mut applied = std::collections::HashSet::new();
+
+    match target {
+        MigrateTarget::Direct(conn) => {
+            if let Ok(rows) = conn.exec_tquery("TQUERY __migrations ORDER BY id ASC LIMIT 1000") {
+                // Each row: [id, "filename", value, "checksum", value, "applied_at", value]
+                for row in &rows {
+                    for i in 0..row.len().saturating_sub(1) {
+                        if row[i] == "filename" {
+                            let name = &row[i + 1];
+                            if !name.is_empty() {
+                                applied.insert(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        MigrateTarget::Cloud { .. } => {
+            if let Ok(output) = target
+                .exec("TQUERY __migrations ORDER BY id ASC LIMIT 1000")
+                .await
+            {
+                for line in output.lines() {
+                    if let Some(pos) = line.find("\"filename\"") {
+                        let rest = &line[pos + 10..];
+                        if let Some(start) = rest.find('"') {
+                            let inner = &rest[start + 1..];
+                            if let Some(end) = inner.find('"') {
+                                let name = &inner[..end];
+                                if !name.is_empty() {
+                                    applied.insert(name.to_string());
+                                }
+                            }
+                        }
+                    } else if let Some(pos) = line.find("filename") {
+                        let rest = &line[pos + 8..];
+                        let name = rest.split_whitespace().next().unwrap_or("");
+                        let name = name.trim_matches('"');
+                        if !name.is_empty() {
+                            applied.insert(name.to_string());
+                        }
+                    }
                 }
             }
         }
