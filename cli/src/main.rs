@@ -400,10 +400,10 @@ async fn main() {
                 });
 
             let body: serde_json::Value = res.json().await.unwrap();
-            if let Some(output) = body.get("output").and_then(|v| v.as_str()) {
-                println!("{output}");
-            } else if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
+            if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
                 eprintln!("{} {error}", "Error:".red());
+            } else {
+                println!("{}", format_json_value(&body));
             }
         }
 
@@ -1077,21 +1077,58 @@ async fn exec_command(
         return Err(err.to_string());
     }
 
-    let output = body
-        .get("output")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
 
-    if output.starts_with("(error)") {
-        return Err(output);
+    Ok(format_json_value(&body))
+}
+
+async fn exec_command_json(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+    command: &str,
+) -> Result<serde_json::Value, String> {
+    let res = client
+        .post(format!("{api_url}/console/{instance_id}/exec"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "command": command }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = res.status();
+    let body: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
+
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
     }
 
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
     }
 
-    Ok(output)
+    Ok(body)
+}
+
+fn format_json_value(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::Null => "(nil)".to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(format_json_value)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(_) => val.to_string(),
+    }
 }
 
 fn resp_encode(args: &[&str]) -> Vec<u8> {
@@ -1382,29 +1419,34 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> std::collections:
                 }
             }
         }
-        MigrateTarget::Cloud { .. } => {
-            if let Ok(output) = target
-                .exec("TQUERY __migrations ORDER BY id ASC LIMIT 1000")
-                .await
+        MigrateTarget::Cloud {
+            client,
+            api_url,
+            token,
+            instance_id,
+        } => {
+            if let Ok(body) = exec_command_json(
+                client,
+                api_url,
+                token,
+                instance_id,
+                "TQUERY __migrations ORDER BY id ASC LIMIT 1000",
+            )
+            .await
             {
-                for line in output.lines() {
-                    if let Some(pos) = line.find("\"filename\"") {
-                        let rest = &line[pos + 10..];
-                        if let Some(start) = rest.find('"') {
-                            let inner = &rest[start + 1..];
-                            if let Some(end) = inner.find('"') {
-                                let name = &inner[..end];
-                                if !name.is_empty() {
-                                    applied.insert(name.to_string());
+                // API returns [[id, "field", "val", ...], ...]
+                if let Some(rows) = body.as_array() {
+                    for row in rows {
+                        if let Some(fields) = row.as_array() {
+                            for i in 0..fields.len().saturating_sub(1) {
+                                if fields[i].as_str() == Some("filename") {
+                                    if let Some(name) = fields[i + 1].as_str() {
+                                        if !name.is_empty() {
+                                            applied.insert(name.to_string());
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    } else if let Some(pos) = line.find("filename") {
-                        let rest = &line[pos + 8..];
-                        let name = rest.split_whitespace().next().unwrap_or("");
-                        let name = name.trim_matches('"');
-                        if !name.is_empty() {
-                            applied.insert(name.to_string());
                         }
                     }
                 }
