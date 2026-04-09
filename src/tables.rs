@@ -201,6 +201,7 @@ pub struct FieldDef {
     pub primary_key: bool,
     pub unique: bool,
     pub nullable: bool, // true = nullable (default), false = NOT NULL
+    pub default_value: Option<String>, // DEFAULT value for the column
     pub references: Option<ForeignKey>,
 }
 
@@ -285,14 +286,6 @@ pub struct SelectPlan {
     // LIMIT / OFFSET
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-}
-
-/// Legacy plan used by TQUERY - kept for backwards compat internally
-pub struct QueryPlan {
-    pub conditions: Vec<WhereClause>,
-    pub join_field: Option<String>,
-    pub order_by: Option<(String, bool)>,
-    pub limit: Option<usize>,
 }
 
 fn schema_key(table: &str) -> String {
@@ -381,11 +374,20 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
     let mut primary_key = false;
     let mut unique = false;
     let mut nullable = true;
+    let mut default_value: Option<String> = None;
     let mut references: Option<ForeignKey> = None;
 
     let mut i = 2;
     while i < tokens.len() {
         match tokens[i].to_uppercase().as_str() {
+            "DEFAULT" => {
+                i += 1;
+                if i >= tokens.len() {
+                    return Err("ERR DEFAULT requires a value".to_string());
+                }
+                default_value = Some(tokens[i].to_string());
+                i += 1;
+            }
             "PRIMARY" => {
                 i += 1;
                 if i >= tokens.len() || tokens[i].to_uppercase() != "KEY" {
@@ -481,6 +483,7 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
         primary_key,
         unique,
         nullable,
+        default_value,
         references,
     })
 }
@@ -586,6 +589,9 @@ fn encode_field_def(def: &FieldDef) -> String {
         };
         parts.push(format!("ref:{}:{}:{}", fk.table, fk.column, on_delete));
     }
+    if let Some(default) = &def.default_value {
+        parts.push(format!("default:{}", default));
+    }
     parts.join("|")
 }
 
@@ -608,6 +614,7 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
     let mut primary_key = false;
     let mut unique = false;
     let mut nullable = true;
+    let mut default_value: Option<String> = None;
     let mut references: Option<ForeignKey> = None;
 
     for flag in &parts[1..] {
@@ -634,6 +641,9 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
                     });
                 }
             }
+            s if s.starts_with("default:") => {
+                default_value = Some(s[8..].to_string());
+            }
             _ => {}
         }
     }
@@ -644,6 +654,7 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
         primary_key,
         unique,
         nullable,
+        default_value,
         references,
     }
 }
@@ -1000,9 +1011,22 @@ pub fn table_insert(
 
     // --- Encode and store ---
     let mut pairs_owned: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // Always materialize the PK as a stored field so WHERE/JOIN can reference it.
+    // If there's an explicit PK column it will be written below in the schema loop.
+    // If there's no explicit PK (implicit auto-increment), store it as "id".
+    let has_explicit_pk = pk_field.is_some();
+    if !has_explicit_pk {
+        pairs_owned.push(("id".to_string(), pk_str.as_bytes().to_vec()));
+    }
+
     for field in &schema {
         if let Some(value) = provided.get(field.name.as_str()) {
             let encoded = field.field_type.encode_value(value)?;
+            pairs_owned.push((field.name.clone(), encoded));
+        } else if field.primary_key {
+            // Explicit PK that was auto-generated (INT pk) - store its value
+            let encoded = FieldType::Int.encode_value(&pk_str)?;
             pairs_owned.push((field.name.clone(), encoded));
         }
     }
@@ -1224,10 +1248,11 @@ pub fn table_delete(
                 if fk.table != table {
                     continue;
                 }
-                // Find all rows in other_table where field == pk_value
-                let ukey = uniq_key(other_table, &field.name);
-                let referencing_ids: Vec<String> = {
-                    // Look up via the unique index (value -> row_id mapping)
+                // Find all rows in other_table where field == pk_value.
+                // If the FK column is unique, we can look it up directly.
+                // Otherwise we must scan all rows.
+                let referencing_ids: Vec<String> = if field.unique {
+                    let ukey = uniq_key(other_table, &field.name);
                     if let Some(ref_id_bytes) =
                         store.hget(ukey.as_bytes(), pk_value.as_bytes(), now)
                     {
@@ -1235,6 +1260,21 @@ pub fn table_delete(
                     } else {
                         vec![]
                     }
+                } else {
+                    // Full scan: find all rows where the FK field equals pk_value
+                    get_all_row_ids(store, other_table, now)
+                        .into_iter()
+                        .filter(|other_pk| {
+                            let rk = row_key_for_pk(other_table, other_pk);
+                            if let Ok(pairs) = store.hgetall(rk.as_bytes(), now) {
+                                pairs.iter().any(|(k, v)| {
+                                    k == &field.name && FieldType::Int.decode_value(v) == pk_value
+                                })
+                            } else {
+                                false
+                            }
+                        })
+                        .collect()
                 };
 
                 if referencing_ids.is_empty() {
@@ -1290,6 +1330,187 @@ pub fn table_delete(
     store.del(&[rk.as_bytes()]);
 
     Ok(())
+}
+
+/// Parse WHERE conditions from command args (field op value [AND ...])
+fn parse_where_conditions(args: &[&str]) -> Result<Vec<WhereClause>, String> {
+    let mut conditions = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if i + 2 >= args.len() {
+            return Err("ERR incomplete WHERE clause".to_string());
+        }
+        let field = args[i].to_string();
+        let op_str = args[i + 1];
+        let value = args[i + 2].to_string();
+        let op = parse_cmp_op(op_str)?;
+        conditions.push(WhereClause { field, op, value });
+        i += 3;
+        // Check for AND
+        if i < args.len() && args[i].to_uppercase() == "AND" {
+            i += 1;
+        }
+    }
+    Ok(conditions)
+}
+
+/// Apply WHERE conditions to check if a row matches
+fn row_matches_conditions(
+    row_map: &std::collections::HashMap<String, String>,
+    conditions: &[WhereClause],
+) -> bool {
+    for cond in conditions {
+        let field_val = match row_map.get(&cond.field) {
+            Some(v) => v,
+            None => return false, // Field doesn't exist, no match
+        };
+        let matches = match cond.op {
+            CmpOp::Eq => field_val == &cond.value,
+            CmpOp::Ne => field_val != &cond.value,
+            CmpOp::Gt => {
+                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
+                    fv > cv
+                } else {
+                    field_val > &cond.value
+                }
+            }
+            CmpOp::Lt => {
+                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
+                    fv < cv
+                } else {
+                    field_val < &cond.value
+                }
+            }
+            CmpOp::Ge => {
+                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
+                    fv >= cv
+                } else {
+                    field_val >= &cond.value
+                }
+            }
+            CmpOp::Le => {
+                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
+                    fv <= cv
+                } else {
+                    field_val <= &cond.value
+                }
+            }
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
+}
+
+/// Update rows matching WHERE conditions, returns count of updated rows
+pub fn table_update_where(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    where_args: &[&str],
+    now: Instant,
+) -> Result<i64, String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let conditions = parse_where_conditions(where_args)?;
+
+    // Validate all fields to update exist
+    for (fname, _) in field_values {
+        schema
+            .iter()
+            .find(|f| &f.name == *fname)
+            .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
+    }
+
+    // Validate all WHERE fields exist (allow "id" for tables with implicit PK)
+    let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
+    for cond in &conditions {
+        let is_implicit_id = has_implicit_pk && cond.field == "id";
+        if !is_implicit_id {
+            schema
+                .iter()
+                .find(|f| f.name == cond.field)
+                .ok_or_else(|| format!("ERR unknown field '{}' in WHERE clause", cond.field))?;
+        }
+    }
+
+    let row_ids = get_all_row_ids(store, table, now);
+    let mut updated_count = 0i64;
+
+    for pk_str in row_ids {
+        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
+            continue;
+        };
+        let row_map: std::collections::HashMap<String, String> = row.into_iter().collect();
+
+        if !row_matches_conditions(&row_map, &conditions) {
+            continue;
+        }
+
+        // Parse the ID
+        let id: i64 = pk_str
+            .parse()
+            .map_err(|_| format!("ERR invalid row id '{}'", pk_str))?;
+
+        // Update this row using the existing table_update logic
+        table_update(store, cache, table, id, field_values, now)?;
+        updated_count += 1;
+    }
+
+    Ok(updated_count)
+}
+
+/// Delete rows matching WHERE conditions, returns count of deleted rows
+pub fn table_delete_where(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    where_args: &[&str],
+    now: Instant,
+) -> Result<i64, String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let conditions = parse_where_conditions(where_args)?;
+
+    // Validate all WHERE fields exist (allow "id" for tables with implicit PK)
+    let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
+    for cond in &conditions {
+        let is_implicit_id = has_implicit_pk && cond.field == "id";
+        if !is_implicit_id {
+            schema
+                .iter()
+                .find(|f| f.name == cond.field)
+                .ok_or_else(|| format!("ERR unknown field '{}' in WHERE clause", cond.field))?;
+        }
+    }
+
+    let row_ids = get_all_row_ids(store, table, now);
+    let mut deleted_count = 0i64;
+
+    // Collect IDs to delete first (to avoid modifying while iterating)
+    let mut ids_to_delete: Vec<i64> = Vec::new();
+
+    for pk_str in row_ids {
+        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
+            continue;
+        };
+        let row_map: std::collections::HashMap<String, String> = row.into_iter().collect();
+
+        if row_matches_conditions(&row_map, &conditions) {
+            let id: i64 = pk_str
+                .parse()
+                .map_err(|_| format!("ERR invalid row id '{}'", pk_str))?;
+            ids_to_delete.push(id);
+        }
+    }
+
+    // Now delete them
+    for id in ids_to_delete {
+        table_delete(store, cache, table, id, now)?;
+        deleted_count += 1;
+    }
+
+    Ok(deleted_count)
 }
 
 pub fn table_drop(
@@ -1423,6 +1644,18 @@ pub fn table_add_column(
         return Err(format!("ERR field '{}' already exists", new_field.name));
     }
 
+    // Check if there are existing rows
+    let row_ids = get_all_row_ids(store, table, now);
+    let has_rows = !row_ids.is_empty();
+
+    // If column is NOT NULL and has no DEFAULT, error if there are existing rows
+    if has_rows && !new_field.nullable && new_field.default_value.is_none() {
+        return Err(format!(
+            "ERR column '{}' is NOT NULL without a DEFAULT value; cannot add to table with existing rows",
+            new_field.name
+        ));
+    }
+
     let key = schema_key(table);
     let encoded = encode_field_def(&new_field);
     store.hset(
@@ -1434,8 +1667,47 @@ pub fn table_add_column(
         now,
     )?;
 
-    // Invalidate so the next load picks up the new field from the Store
+    // Invalidate cache so next load picks up the new field
     cache.write().remove(table);
+
+    // Backfill existing rows with DEFAULT value or NULL
+    if has_rows {
+        let backfill_value = match &new_field.default_value {
+            Some(default) => default.clone(),
+            None => "NULL".to_string(), // Will be stored as actual NULL
+        };
+
+        for pk_str in row_ids {
+            let rk = row_key_for_pk(table, &pk_str);
+            let encoded = if backfill_value == "NULL" {
+                // Store empty/NULL value
+                vec![]
+            } else {
+                new_field.field_type.encode_value(&backfill_value)?
+            };
+            store.hset(
+                rk.as_bytes(),
+                &[(new_field.name.as_bytes() as &[u8], encoded.as_slice())],
+                now,
+            )?;
+
+            // Add to indexes if needed
+            if backfill_value != "NULL" {
+                add_to_index(store, table, &new_field, &backfill_value, &pk_str, now);
+                if new_field.unique {
+                    let ukey = uniq_key(table, &new_field.name);
+                    store.hset(
+                        ukey.as_bytes(),
+                        &[(
+                            backfill_value.as_bytes() as &[u8],
+                            pk_str.as_bytes() as &[u8],
+                        )],
+                        now,
+                    )?;
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1508,24 +1780,38 @@ fn get_row(
     pk_str: &str,
     now: Instant,
 ) -> Option<Vec<(String, String)>> {
+    // Build a lookup map on the fly - only called from paths that don't have a pre-built map.
+    // Hot paths (table_select) use get_row_with_map directly.
+    let type_map: hashbrown::HashMap<&str, &FieldType> = schema
+        .iter()
+        .map(|f| (f.name.as_str(), &f.field_type))
+        .collect();
+    get_row_with_map(store, table, &type_map, pk_str, now)
+}
+
+/// Hot-path row fetch: takes a pre-built field-type map to avoid O(N) schema scan per field.
+#[inline]
+fn get_row_with_map(
+    store: &Store,
+    table: &str,
+    type_map: &hashbrown::HashMap<&str, &FieldType>,
+    pk_str: &str,
+    now: Instant,
+) -> Option<Vec<(String, String)>> {
     let rk = row_key_for_pk(table, pk_str);
     let pairs = store.hgetall(rk.as_bytes(), now).unwrap_or_default();
     if pairs.is_empty() {
         return None;
     }
-    Some(
-        pairs
-            .into_iter()
-            .map(|(k, v)| {
-                let field_type = schema.iter().find(|f| f.name == k).map(|f| &f.field_type);
-                let decoded = match field_type {
-                    Some(ft) => ft.decode_value(&v),
-                    None => String::from_utf8_lossy(&v).to_string(),
-                };
-                (k, decoded)
-            })
-            .collect(),
-    )
+    let mut out = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        let decoded = match type_map.get(k.as_str()) {
+            Some(ft) => ft.decode_value(&v),
+            None => String::from_utf8_lossy(&v).to_string(),
+        };
+        out.push((k, decoded));
+    }
+    Some(out)
 }
 
 fn matches_condition(row: &[(String, String)], cond: &WhereClause, field_def: &FieldDef) -> bool {
@@ -1636,238 +1922,6 @@ fn candidates_from_index(
             Some(ids)
         }
     }
-}
-
-pub type QueryRow = (i64, Vec<(String, String)>);
-
-pub fn table_query(
-    store: &Store,
-    cache: &SharedSchemaCache,
-    table: &str,
-    plan: &QueryPlan,
-    now: Instant,
-) -> Result<Vec<QueryRow>, String> {
-    let schema = load_schema(store, cache, table, now)?;
-
-    for cond in &plan.conditions {
-        if !schema.iter().any(|f| f.name == cond.field) {
-            return Err(format!(
-                "ERR unknown field '{}' in WHERE clause",
-                cond.field
-            ));
-        }
-    }
-
-    let mut candidate_pks: Option<HashSet<String>> = None;
-
-    for cond in &plan.conditions {
-        let field_def = schema.iter().find(|f| f.name == cond.field).unwrap();
-        if let Some(pks) = candidates_from_index(store, table, cond, field_def, now) {
-            let pk_set: HashSet<String> = pks.into_iter().collect();
-            candidate_pks = Some(match candidate_pks {
-                Some(existing) => existing.intersection(&pk_set).cloned().collect(),
-                None => pk_set,
-            });
-        }
-    }
-
-    let pk_strs = match candidate_pks {
-        Some(pks) => pks.into_iter().collect::<Vec<_>>(),
-        None => get_all_row_ids(store, table, now),
-    };
-
-    let mut results: Vec<(i64, Vec<(String, String)>)> = Vec::new();
-    for pk_str in pk_strs {
-        let row = match get_row(store, table, &schema, &pk_str, now) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        let mut passes = true;
-        for cond in &plan.conditions {
-            let field_def = schema.iter().find(|f| f.name == cond.field).unwrap();
-            if !matches_condition(&row, cond, field_def) {
-                passes = false;
-                break;
-            }
-        }
-        if passes {
-            let id: i64 = pk_str.parse().unwrap_or(0);
-            results.push((id, row));
-        }
-    }
-
-    if let Some((ref order_field, ascending)) = plan.order_by {
-        let field_def = schema.iter().find(|f| f.name == *order_field);
-        results.sort_by(|a, b| {
-            let av =
-                a.1.iter()
-                    .find(|(k, _)| k == order_field)
-                    .map(|(_, v)| v.as_str())
-                    .unwrap_or("");
-            let bv =
-                b.1.iter()
-                    .find(|(k, _)| k == order_field)
-                    .map(|(_, v)| v.as_str())
-                    .unwrap_or("");
-            let cmp = if let Some(fd) = field_def {
-                match &fd.field_type {
-                    FieldType::Int | FieldType::Bool | FieldType::Timestamp | FieldType::Ref(_) => {
-                        let ai: i64 = av.parse().unwrap_or(0);
-                        let bi: i64 = bv.parse().unwrap_or(0);
-                        ai.cmp(&bi)
-                    }
-                    FieldType::Float => {
-                        let af: f64 = av.parse().unwrap_or(0.0);
-                        let bf: f64 = bv.parse().unwrap_or(0.0);
-                        af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-                    }
-                    FieldType::Str | FieldType::Uuid => av.cmp(bv),
-                }
-            } else {
-                av.cmp(bv)
-            };
-            if ascending {
-                cmp
-            } else {
-                cmp.reverse()
-            }
-        });
-    }
-
-    if let Some(limit) = plan.limit {
-        results.truncate(limit);
-    }
-
-    if let Some(ref join_field_name) = plan.join_field {
-        let field_def = schema
-            .iter()
-            .find(|f| f.name == *join_field_name)
-            .ok_or_else(|| format!("ERR unknown field '{}' for JOIN", join_field_name))?;
-        let ref_table = match &field_def.field_type {
-            FieldType::Ref(t) => t.clone(),
-            _ => {
-                return Err(format!(
-                    "ERR field '{}' is not a ref() field",
-                    join_field_name
-                ))
-            }
-        };
-
-        let ref_schema = load_schema(store, cache, &ref_table, now)?;
-
-        for (_, row) in results.iter_mut() {
-            let ref_id_str = row
-                .iter()
-                .find(|(k, _)| k == join_field_name)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
-            if let Some(ref_row) = get_row(store, &ref_table, &ref_schema, &ref_id_str, now) {
-                for (rk, rv) in ref_row {
-                    row.push((format!("{}.{}", ref_table, rk), rv));
-                }
-            }
-        }
-    }
-
-    Ok(results)
-}
-
-pub fn parse_query_args(args: &[&str], start: usize) -> Result<QueryPlan, String> {
-    let mut conditions = Vec::new();
-    let mut join_field = None;
-    let mut order_by = None;
-    let mut limit = None;
-    let mut i = start;
-
-    while i < args.len() {
-        let keyword = args[i].to_uppercase();
-        match keyword.as_str() {
-            "WHERE" => {
-                i += 1;
-                loop {
-                    if i + 2 >= args.len() {
-                        return Err("ERR incomplete WHERE clause".to_string());
-                    }
-                    let field = args[i].to_string();
-                    let op_str = args[i + 1];
-                    let value = args[i + 2].to_string();
-                    let op = match op_str {
-                        "=" => CmpOp::Eq,
-                        "!=" => CmpOp::Ne,
-                        ">" => CmpOp::Gt,
-                        "<" => CmpOp::Lt,
-                        ">=" => CmpOp::Ge,
-                        "<=" => CmpOp::Le,
-                        _ => return Err(format!("ERR unknown operator '{}'", op_str)),
-                    };
-                    conditions.push(WhereClause { field, op, value });
-                    i += 3;
-                    if i < args.len() && args[i].to_uppercase() == "AND" {
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            "JOIN" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("ERR JOIN requires a field name".to_string());
-                }
-                join_field = Some(args[i].to_string());
-                i += 1;
-            }
-            "ORDER" => {
-                i += 1;
-                if i >= args.len() || args[i].to_uppercase() != "BY" {
-                    return Err("ERR expected BY after ORDER".to_string());
-                }
-                i += 1;
-                if i >= args.len() {
-                    return Err("ERR ORDER BY requires a field name".to_string());
-                }
-                let field = args[i].to_string();
-                i += 1;
-                let ascending = if i < args.len() {
-                    let dir = args[i].to_uppercase();
-                    if dir == "ASC" {
-                        i += 1;
-                        true
-                    } else if dir == "DESC" {
-                        i += 1;
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                };
-                order_by = Some((field, ascending));
-            }
-            "LIMIT" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("ERR LIMIT requires a number".to_string());
-                }
-                let n: usize = args[i]
-                    .parse()
-                    .map_err(|_| "ERR LIMIT value must be a positive integer".to_string())?;
-                limit = Some(n);
-                i += 1;
-            }
-            _ => {
-                return Err(format!("ERR unexpected keyword '{}'", args[i]));
-            }
-        }
-    }
-
-    Ok(QueryPlan {
-        conditions,
-        join_field,
-        order_by,
-        limit,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2253,9 +2307,15 @@ pub fn table_select(
     }
 
     // ---- Scan primary table ----
+    // Build a field-type lookup map ONCE per query so get_row doesn't O(N) scan per field.
+    let type_map: hashbrown::HashMap<&str, &FieldType> = schema
+        .iter()
+        .map(|f| (f.name.as_str(), &f.field_type))
+        .collect();
+
     // Apply LIMIT early when there are no joins - avoids fetching rows we'll
     // just discard later.
-    let candidates = build_candidates(store, &plan.table, &schema, &conditions, now);
+    let mut candidates = build_candidates(store, &plan.table, &schema, &conditions, now);
     // Apply LIMIT early only when safe to do so:
     // - no joins (join changes the row count unpredictably)
     // - no ORDER BY (ordering requires all rows before truncating)
@@ -2264,10 +2324,13 @@ pub fn table_select(
     } else {
         None
     };
+    if let Some(lim) = early_limit {
+        candidates.truncate(lim);
+    }
 
     let mut rows: Vec<Vec<(String, String)>> = candidates
         .into_iter()
-        .filter_map(|pk_str| get_row(store, &plan.table, &schema, &pk_str, now))
+        .filter_map(|pk_str| get_row_with_map(store, &plan.table, &type_map, &pk_str, now))
         .filter(|row| {
             conditions.iter().all(|cond| {
                 let bare = bare_col(&cond.field);

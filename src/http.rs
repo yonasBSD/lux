@@ -30,6 +30,7 @@ pub async fn start_http_server(
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
+    max_rows: Option<usize>,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let socket = TcpSocket::new_v4()?;
@@ -46,7 +47,7 @@ pub async fn start_http_server(
 
         tokio::spawn(async move {
             let mut stream = socket;
-            while let Ok(true) = handle_request(&mut stream, &store, &broker, &cache).await {}
+            while let Ok(true) = handle_request(&mut stream, &store, &broker, &cache, max_rows).await {}
         });
     }
 }
@@ -56,6 +57,7 @@ async fn handle_request(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    max_rows: Option<usize>,
 ) -> std::io::Result<bool> {
     let mut buf = vec![0u8; 65536];
     let mut data = Vec::new();
@@ -98,8 +100,8 @@ async fn handle_request(
     if method == "OPTIONS" {
         let response = "HTTP/1.1 204 No Content\r\n\
              Access-Control-Allow-Origin: *\r\n\
-             Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
+             Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
+             Access-Control-Allow-Headers: Authorization, Content-Type, Prefer\r\n\
              Content-Length: 0\r\n\r\n"
             .to_string();
         socket.write_all(response.as_bytes()).await?;
@@ -133,7 +135,11 @@ async fn handle_request(
     if method == "GET" {
         match segments.as_slice() {
             ["v1", "tables", table] => {
-                return stream_table_query(socket, table, &params, store, cache).await;
+                let prefer = headers.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("prefer"))
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                return stream_table_query(socket, table, &params, prefer, store, cache, max_rows).await;
             }
             ["v1", "tables", table, "count"] => {
                 let now = std::time::Instant::now();
@@ -184,14 +190,24 @@ async fn stream_table_query(
     socket: &mut tokio::net::TcpStream,
     table: &str,
     params: &[(String, String)],
+    prefer: &str,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    max_rows: Option<usize>,
 ) -> std::io::Result<bool> {
     use tokio::io::AsyncWriteExt;
 
     let now = std::time::Instant::now();
 
-    // Build select tokens from params
+    let has_where = get_param(params, "where").is_some();
+    let client_limit: Option<usize> = get_param(params, "limit").and_then(|s| s.parse().ok());
+    let offset: usize = get_param(params, "offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let count_exact = prefer.contains("count=exact");
+
+    // Effective limit: client wins, else LUX_MAX_ROWS, else none
+    let effective_limit = client_limit.or(max_rows);
+
+    // Build select tokens
     let mut tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
     if let Some(w) = get_param(params, "where") {
         tokens.push("WHERE".to_string());
@@ -206,13 +222,13 @@ async fn stream_table_query(
         tokens.push("BY".to_string());
         for p in o.split_whitespace() { tokens.push(p.to_string()); }
     }
-    if let Some(l) = get_param(params, "limit") {
+    if let Some(lim) = effective_limit {
         tokens.push("LIMIT".to_string());
-        tokens.push(l.to_string());
+        tokens.push(lim.to_string());
     }
-    if let Some(o) = get_param(params, "offset") {
+    if offset > 0 {
         tokens.push("OFFSET".to_string());
-        tokens.push(o.to_string());
+        tokens.push(offset.to_string());
     }
 
     let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
@@ -231,7 +247,6 @@ async fn stream_table_query(
             return send_json(socket, 400, "Bad Request", &body).await;
         }
         Ok(crate::tables::SelectResult::Aggregate(row)) => {
-            // Aggregates are always small - no need to stream
             let body = {
                 let mut out = String::with_capacity(128);
                 out.push_str(r#"{"result":{"#);
@@ -251,14 +266,55 @@ async fn stream_table_query(
             return send_json(socket, 200, "OK", &body).await;
         }
         Ok(crate::tables::SelectResult::Rows(rows)) => {
-            // Stream rows using chunked transfer encoding, batching rows into
-            // ~64KB chunks to minimise syscall overhead.
-            const CHUNK_SIZE: usize = 65536;
+            let returned = rows.len();
+            let range_end = if returned == 0 { offset } else { offset + returned - 1 };
 
-            let header = "HTTP/1.1 200 OK\r\n\
-                Content-Type: application/json\r\n\
-                Transfer-Encoding: chunked\r\n\
-                Access-Control-Allow-Origin: *\r\n\r\n";
+            // Compute Content-Range value:
+            // - No WHERE: total is cheap (zcard), always exact
+            // - WHERE + Prefer:count=exact: run a count query
+            // - WHERE, no preference: total is unknown (*)
+            let total_str = if !has_where {
+                // Free - zcard on the ids sorted set
+                let total = crate::tables::table_count(store, cache, table, now)
+                    .unwrap_or(returned as i64);
+                total.to_string()
+            } else if count_exact {
+                // Run a count-only query with the same WHERE
+                let mut count_tokens: Vec<String> = vec![
+                    "COUNT(*)".to_string(), "FROM".to_string(), table.to_string(),
+                ];
+                if let Some(w) = get_param(params, "where") {
+                    count_tokens.push("WHERE".to_string());
+                    for p in w.split_whitespace() { count_tokens.push(p.to_string()); }
+                }
+                let count_refs: Vec<&str> = count_tokens.iter().map(|s| s.as_str()).collect();
+                let total = crate::tables::parse_select(&count_refs)
+                    .ok()
+                    .and_then(|plan| crate::tables::table_select(store, cache, &plan, now).ok())
+                    .and_then(|res| match res {
+                        crate::tables::SelectResult::Aggregate(row) => {
+                            row.into_iter().find(|(k, _)| k == "COUNT(*)")
+                               .and_then(|(_, v)| v.parse::<i64>().ok())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(returned as i64);
+                total.to_string()
+            } else {
+                "*".to_string()
+            };
+
+            let content_range = format!("{}-{}/{}", offset, range_end, total_str);
+
+            const CHUNK_SIZE: usize = 65536;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Transfer-Encoding: chunked\r\n\
+                 Content-Range: {content_range}\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Connection: close\r\n\r\n"
+            );
             socket.write_all(header.as_bytes()).await?;
 
             let mut buf = String::with_capacity(CHUNK_SIZE + 4096);
@@ -282,17 +338,17 @@ async fn stream_table_query(
                 }
                 buf.push('}');
 
-                // Flush once we hit the chunk threshold
                 if buf.len() >= CHUNK_SIZE {
                     write_chunk(socket, buf.as_bytes()).await?;
                     buf.clear();
                 }
             }
 
-            // Flush remainder + close
             buf.push_str("]}");
             write_chunk(socket, buf.as_bytes()).await?;
             socket.write_all(b"0\r\n\r\n").await?;
+            // Chunked responses close the connection - client reads until EOF
+            return Ok(false);
         }
     }
 
@@ -494,21 +550,11 @@ fn route_request(
                 Err(e) => (400, "Bad Request", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
             }
         }
-        ("GET", ["tables", table, id]) => {
-            let now = std::time::Instant::now();
-            let id_i64: i64 = match id.parse() {
-                Ok(v) => v,
-                Err(_) => return (400, "Bad Request", r#"{"error":"invalid row id"}"#.to_string()),
-            };
-            match crate::tables::table_get(store, cache, table, id_i64, now) {
-                Ok(row) => ok(row_to_json_object(&row)),
-                Err(e) => (404, "Not Found", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
-            }
-        }
         ("POST", ["tables", table]) => route_table_insert(table, body, store, broker, cache),
-        ("PUT", ["tables", table, id]) => route_table_update(table, id, body, store, broker, cache),
-        ("DELETE", ["tables", table, id]) => ok(exec_simple(store, broker, cache, &["TDEL", table, id])),
-        ("DELETE", ["tables", table]) => ok(exec_simple(store, broker, cache, &["TDROP", table])),
+        // Bulk update via PATCH (requires where parameter for safety)
+        ("PATCH", ["tables", table]) => route_table_update(table, params, body, store, broker, cache),
+        // Bulk delete via DELETE with where parameter (TDROP is separate)
+        ("DELETE", ["tables", table]) => route_table_delete(table, params, store, broker, cache),
 
         // ── Time Series routes ──
         ("GET", ["ts"]) => {
@@ -713,7 +759,7 @@ fn route_table_insert(
     table: &str,
     body: &str,
     store: &Arc<Store>,
-    broker: &Broker,
+    _broker: &Broker,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
@@ -738,61 +784,125 @@ fn route_table_insert(
         }
     };
 
-    let mut args: Vec<String> = vec!["TINSERT".to_string(), table.to_string()];
+    // Build field-value pairs directly - avoids RESP encode/decode round-trip through exec_simple
+    let val_strings: Vec<(String, String)> = obj.iter().map(|(k, v)| {
+        let val = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => String::new(),
+            _ => v.to_string(),
+        };
+        (k.clone(), val)
+    }).collect();
+
+    let field_values: Vec<(&str, &str)> = val_strings
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let now = Instant::now();
+    match crate::tables::table_insert(store, cache, table, &field_values, now) {
+        Ok(id) => ok(format!(r#"{{"result":{}}}"#, id)),
+        Err(e) => (400, "Bad Request", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
+    }
+}
+
+fn route_table_update(
+    table: &str,
+    params: &[(String, String)],
+    body: &str,
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    // Require where parameter for safety (prevents accidental full table updates)
+    let where_clause = match get_param(params, "where") {
+        Some(w) => w,
+        None => {
+            return (
+                400,
+                "Bad Request",
+                r#"{"error":"where parameter required for updates"}"#.to_string(),
+            )
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                400,
+                "Bad Request",
+                r#"{"error":"invalid json"}"#.to_string(),
+            )
+        }
+    };
+
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => {
+            return (
+                400,
+                "Bad Request",
+                r#"{"error":"expected json object"}"#.to_string(),
+            )
+        }
+    };
+
+
+    // Build TUPDATE command: TUPDATE <table> SET <col> <val> ... WHERE <conditions>
+    let mut args: Vec<String> = vec!["TUPDATE".to_string(), table.to_string(), "SET".to_string()];
     for (k, v) in obj {
         args.push(k.clone());
         match v {
             serde_json::Value::String(s) => args.push(s.clone()),
             serde_json::Value::Number(n) => args.push(n.to_string()),
             serde_json::Value::Bool(b) => args.push(b.to_string()),
-            serde_json::Value::Null => args.push("*".to_string()),
             _ => args.push(v.to_string()),
         }
+    }
+    args.push("WHERE".to_string());
+    for part in where_clause.split_whitespace() {
+        args.push(part.to_string());
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     ok(exec_simple(store, broker, cache, &refs))
 }
 
-fn route_table_update(
+fn route_table_delete(
     table: &str,
-    id: &str,
-    body: &str,
+    params: &[(String, String)],
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
-    let parsed: serde_json::Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                400,
-                "Bad Request",
-                r#"{"error":"invalid json"}"#.to_string(),
-            )
+    // Check for drop=true parameter to distinguish from delete
+    if let Some(val) = get_param(params, "drop") {
+        if val == "true" {
+            return ok(exec_simple(store, broker, cache, &["TDROP", table]));
         }
-    };
+    }
 
-    let obj = match parsed.as_object() {
-        Some(o) => o,
+    // Require where parameter for safety (prevents accidental full table deletes)
+    let where_clause = match get_param(params, "where") {
+        Some(w) => w,
         None => {
             return (
                 400,
                 "Bad Request",
-                r#"{"error":"expected json object"}"#.to_string(),
+                r#"{"error":"where parameter required for delete (use drop=true to drop table)"}"#
+                    .to_string(),
             )
         }
     };
 
-    let mut args: Vec<String> = vec!["TUPDATE".to_string(), table.to_string(), id.to_string()];
-    for (k, v) in obj {
-        args.push(k.clone());
-        match v {
-            serde_json::Value::String(s) => args.push(s.clone()),
-            serde_json::Value::Number(n) => args.push(n.to_string()),
-            serde_json::Value::Bool(b) => args.push(b.to_string()),
-            _ => args.push(v.to_string()),
-        }
+    // Build TDELETE command: TDELETE FROM <table> WHERE <conditions>
+    let mut args: Vec<String> = vec!["TDELETE".to_string(), "FROM".to_string(), table.to_string()];
+    args.push("WHERE".to_string());
+    for part in where_clause.split_whitespace() {
+        args.push(part.to_string());
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -1020,7 +1130,9 @@ fn handle_exec(body: &str, store: &Arc<Store>, broker: &Broker, cache: &SharedSc
 fn select_result_to_json(result: crate::tables::SelectResult) -> String {
     match result {
         crate::tables::SelectResult::Rows(rows) => {
-            let mut out = String::with_capacity(rows.len() * 64);
+            // Estimate ~80 bytes per field, 4 fields avg per row - better than 64 flat
+            let est_cols = rows.first().map(|r| r.len()).unwrap_or(4);
+            let mut out = String::with_capacity(12 + rows.len() * est_cols * 24);
             out.push_str(r#"{"result":["#);
             let mut first_row = true;
             for row in rows {

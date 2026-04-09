@@ -35,8 +35,36 @@ fn read_all(stream: &mut TcpStream) -> String {
 
 fn send(stream: &mut TcpStream, args: &[&str]) -> String {
     stream.write_all(&resp_cmd(args)).unwrap();
-    thread::sleep(Duration::from_millis(50));
-    read_all(stream)
+    // Read until we have a complete RESP response rather than sleeping and hoping.
+    // Set a generous timeout so slow restarts don't cause spurious failures.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut data = Vec::with_capacity(256);
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                // A complete simple RESP response ends with \r\n.
+                // For bulk strings we need to check we got the full payload too,
+                // but for our purposes (GET returns +OK, $N\r\n...\r\n, or $-1\r\n)
+                // checking for a trailing \r\n on a non-empty buffer is sufficient.
+                if data.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(_) => break,
+        }
+    }
+    // Restore the normal read timeout.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    String::from_utf8_lossy(&data).to_string()
 }
 
 fn find_lux_binary() -> Option<std::path::PathBuf> {

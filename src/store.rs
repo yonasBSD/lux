@@ -1557,6 +1557,48 @@ impl Store {
         }
     }
 
+    /// Batch hgetall: reads multiple hash keys in one pass, grouped by shard to
+    /// minimize lock acquisitions. Returns results in the same order as `keys`.
+    /// Missing or expired keys produce an empty Vec for that slot.
+    pub fn hgetall_multi(
+        &self,
+        keys: &[Vec<u8>],
+        now: Instant,
+    ) -> Vec<Vec<(String, bytes::Bytes)>> {
+        let n = keys.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        // Group key indices by shard
+        let mut shard_groups: Vec<Vec<usize>> = vec![vec![]; self.shards.len()];
+        for (i, key) in keys.iter().enumerate() {
+            let shard_idx = self.shard_index(key);
+            shard_groups[shard_idx].push(i);
+        }
+
+        let mut results: Vec<Vec<(String, bytes::Bytes)>> = vec![vec![]; n];
+
+        for (shard_idx, indices) in shard_groups.iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let shard = self.shards[shard_idx].read();
+            for &i in indices {
+                let key = &keys[i];
+                if let Some(entry) = shard.data.get(key_str(key)) {
+                    if !entry.is_expired_at(now) {
+                        if let StoreValue::Hash(map) = &entry.value {
+                            results[i] = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
     pub fn hkeys(&self, key: &[u8], now: Instant) -> Result<Vec<String>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();

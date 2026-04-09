@@ -56,75 +56,6 @@ pub fn cmd_tinsert(
     CmdResult::Written
 }
 
-pub fn cmd_tget(
-    args: &[&[u8]],
-    store: &Store,
-    cache: &SharedSchemaCache,
-    out: &mut BytesMut,
-    now: Instant,
-) -> CmdResult {
-    if args.len() != 3 {
-        resp::write_error(out, "ERR wrong number of arguments for 'tget' command");
-        return CmdResult::Written;
-    }
-    let table = arg_str(args[1]);
-    let id: i64 = match arg_str(args[2]).parse() {
-        Ok(v) => v,
-        Err(_) => {
-            resp::write_error(out, "ERR invalid row id");
-            return CmdResult::Written;
-        }
-    };
-    match tables::table_get(store, cache, table, id, now) {
-        Ok(pairs) => {
-            resp::write_array_header(out, pairs.len() * 2);
-            for (k, v) in pairs {
-                resp::write_bulk(out, &k);
-                resp::write_bulk(out, &v);
-            }
-        }
-        Err(e) => resp::write_error(out, &e),
-    }
-    CmdResult::Written
-}
-
-pub fn cmd_tquery(
-    args: &[&[u8]],
-    store: &Store,
-    cache: &SharedSchemaCache,
-    out: &mut BytesMut,
-    now: Instant,
-) -> CmdResult {
-    if args.len() < 2 {
-        resp::write_error(out, "ERR wrong number of arguments for 'tquery' command");
-        return CmdResult::Written;
-    }
-    let table = arg_str(args[1]);
-    let str_args: Vec<&str> = args.iter().map(|a| arg_str(a)).collect();
-    let plan = match tables::parse_query_args(&str_args, 2) {
-        Ok(p) => p,
-        Err(e) => {
-            resp::write_error(out, &e);
-            return CmdResult::Written;
-        }
-    };
-    match tables::table_query(store, cache, table, &plan, now) {
-        Ok(results) => {
-            resp::write_array_header(out, results.len());
-            for (id, row) in results {
-                resp::write_array_header(out, 1 + row.len() * 2);
-                resp::write_integer(out, id);
-                for (k, v) in row {
-                    resp::write_bulk(out, &k);
-                    resp::write_bulk(out, &v);
-                }
-            }
-        }
-        Err(e) => resp::write_error(out, &e),
-    }
-    CmdResult::Written
-}
-
 pub fn cmd_tupdate(
     args: &[&[u8]],
     store: &Store,
@@ -132,52 +63,109 @@ pub fn cmd_tupdate(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    if args.len() < 5 || !(args.len() - 3).is_multiple_of(2) {
-        resp::write_error(out, "ERR wrong number of arguments for 'tupdate' command");
+    // TUPDATE <table> SET <col> <val> [<col> <val> ...] WHERE <conditions>
+    // Minimum: TUPDATE users SET name John WHERE id = 1
+    if args.len() < 7 {
+        resp::write_error(
+            out,
+            "ERR usage: TUPDATE <table> SET <col> <val> ... WHERE <conditions>",
+        );
         return CmdResult::Written;
     }
+
     let table = arg_str(args[1]);
-    let id: i64 = match arg_str(args[2]).parse() {
-        Ok(v) => v,
-        Err(_) => {
-            resp::write_error(out, "ERR invalid row id");
+
+    // Find WHERE keyword position
+    let mut where_pos = None;
+    for (i, arg) in args.iter().enumerate() {
+        if arg_str(arg).to_uppercase() == "WHERE" {
+            where_pos = Some(i);
+            break;
+        }
+    }
+
+    let where_pos = match where_pos {
+        Some(p) if p >= 4 && p + 3 < args.len() => p,
+        _ => {
+            resp::write_error(
+                out,
+                "ERR usage: TUPDATE <table> SET <col> <val> ... WHERE <conditions>",
+            );
             return CmdResult::Written;
         }
     };
+
+    // Parse SET clause: between "SET" (args[2]) and WHERE
+    if arg_str(args[2]).to_uppercase() != "SET" {
+        resp::write_error(out, "ERR expected SET after table name");
+        return CmdResult::Written;
+    }
+
     let mut field_values: Vec<(&str, &str)> = Vec::new();
     let mut i = 3;
-    while i + 1 < args.len() {
+    while i + 1 < where_pos {
         field_values.push((arg_str(args[i]), arg_str(args[i + 1])));
         i += 2;
     }
-    match tables::table_update(store, cache, table, id, &field_values, now) {
-        Ok(()) => resp::write_ok(out),
+
+    if field_values.is_empty() {
+        resp::write_error(out, "ERR no fields to update");
+        return CmdResult::Written;
+    }
+
+    // Parse WHERE clause
+    let where_args: Vec<&str> = args[where_pos + 1..].iter().map(|a| arg_str(a)).collect();
+
+    match tables::table_update_where(store, cache, table, &field_values, &where_args, now) {
+        Ok(count) => resp::write_integer(out, count),
         Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written
 }
 
-pub fn cmd_tdel(
+pub fn cmd_tdelete(
     args: &[&[u8]],
     store: &Store,
     cache: &SharedSchemaCache,
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    if args.len() != 3 {
-        resp::write_error(out, "ERR wrong number of arguments for 'tdel' command");
+    // TDELETE FROM <table> WHERE <conditions>
+    // Minimum: TDELETE FROM users WHERE id = 1
+    if args.len() < 6 {
+        resp::write_error(out, "ERR usage: TDELETE FROM <table> WHERE <conditions>");
         return CmdResult::Written;
     }
-    let table = arg_str(args[1]);
-    let id: i64 = match arg_str(args[2]).parse() {
-        Ok(v) => v,
-        Err(_) => {
-            resp::write_error(out, "ERR invalid row id");
+
+    if arg_str(args[1]).to_uppercase() != "FROM" {
+        resp::write_error(out, "ERR expected FROM");
+        return CmdResult::Written;
+    }
+
+    let table = arg_str(args[2]);
+
+    // Find WHERE keyword
+    let mut where_pos = None;
+    for (i, arg) in args.iter().enumerate().skip(3) {
+        if arg_str(arg).to_uppercase() == "WHERE" {
+            where_pos = Some(i);
+            break;
+        }
+    }
+
+    let where_pos = match where_pos {
+        Some(p) if p + 3 < args.len() => p,
+        _ => {
+            resp::write_error(out, "ERR incomplete WHERE clause");
             return CmdResult::Written;
         }
     };
-    match tables::table_delete(store, cache, table, id, now) {
-        Ok(()) => resp::write_ok(out),
+
+    // Parse WHERE clause
+    let where_args: Vec<&str> = args[where_pos + 1..].iter().map(|a| arg_str(a)).collect();
+
+    match tables::table_delete_where(store, cache, table, &where_args, now) {
+        Ok(count) => resp::write_integer(out, count),
         Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written
@@ -260,8 +248,14 @@ pub fn cmd_talter(
     let action = arg_str(args[2]).to_uppercase();
     match action.as_str() {
         "ADD" => {
-            let field_spec = arg_str(args[3]);
-            match tables::table_add_column(store, cache, table, field_spec, now) {
+            // Join all tokens after ADD into one space-separated field spec
+            // e.g. TALTER users ADD price FLOAT DEFAULT 9.99
+            let field_spec = args[3..]
+                .iter()
+                .map(|a| arg_str(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match tables::table_add_column(store, cache, table, &field_spec, now) {
                 Ok(()) => resp::write_ok(out),
                 Err(e) => resp::write_error(out, &e),
             }

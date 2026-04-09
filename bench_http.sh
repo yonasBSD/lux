@@ -67,6 +67,7 @@ docker run -d --name lux_bench_pgrst --network host \
     -e PGRST_DB_URI="postgres://bench:bench@127.0.0.1:${PG_PORT}/bench" \
     -e PGRST_DB_SCHEMA=public -e PGRST_DB_ANON_ROLE=anon \
     -e PGRST_SERVER_PORT="$PGRST_PORT" \
+    -e PGRST_DB_MAX_ROWS=1000000 \
     postgrest/postgrest:latest >/dev/null
 for i in $(seq 1 30); do
     curl -s "http://127.0.0.1:${PGRST_PORT}/users?limit=1" >/dev/null 2>&1 && break || sleep 0.5
@@ -115,22 +116,39 @@ PYEOF
 t1=$(now_ms)
 LUX_INS_MS=$((t1-t0)); LUX_INS_RPS=$(awk "BEGIN{printf \"%.0f\",$ROWS/($LUX_INS_MS/1000.0)}")
 
-echo "  Postgres (COPY)..."
+echo "  Postgres (HTTP POST pipelined)..."
 t0=$(now_ms)
-perl -e "print join(\"\\n\",map{sprintf(\"%d\\tUser_%d\\tu%d\@b.com\\t%d\\t%s\",\$_,\$_,\$_,(\$_%60)+18,\$_%2==0?\"t\":\"f\")} 1..$ROWS)" \
-    | PGPASSWORD=bench psql -h 127.0.0.1 -p "$PG_PORT" -U bench -d bench -q \
-        -c "\COPY users(id,name,email,age,active) FROM STDIN"
+python3 - << PYEOF
+import socket
+s=socket.socket(); s.connect(("127.0.0.1",$PGRST_PORT))
+s.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1); s.settimeout(120)
+buf=b""
+def do(body, path="/users"):
+    global buf
+    r=f"POST /v1/tables/users HTTP/1.1\r\nHost:localhost\r\nContent-Type:application/json\r\nContent-Length:{len(body)}\r\n\r\n{body}"
+    # PostgREST uses different path
+    r2=f"POST {path} HTTP/1.1\r\nHost:localhost\r\nContent-Type:application/json\r\nPrefer:return=minimal\r\nContent-Length:{len(body)}\r\n\r\n{body}"
+    s.sendall(r2.encode())
+    while b"\r\n\r\n" not in buf: buf+=s.recv(65536)
+    h,rest=buf.split(b"\r\n\r\n",1)
+    cl=next((int(l.split(b":")[1]) for l in h.split(b"\r\n") if l.lower().startswith(b"content-length")),0)
+    while len(rest)<cl: rest+=s.recv(65536)
+    buf=rest[cl:]
+for i in range(1,$ROWS+1):
+    do('{"id":"%d","name":"User_%d","email":"u%d@b.com","age":"%d","active":"%s"}'%(i,i,i,(i%60)+18,"true"if i%2==0 else"false"))
+s.close()
+PYEOF
 t1=$(now_ms)
 PG_INS_MS=$((t1-t0)); PG_INS_RPS=$(awk "BEGIN{printf \"%.0f\",$ROWS/($PG_INS_MS/1000.0)}")
 
 printf "  %-14s  %10s  %6dms\n" "Lux"         "$(fmt_rps $LUX_INS_RPS)" $LUX_INS_MS
-printf "  %-14s  %10s  %6dms\n" "PG (COPY)"   "$(fmt_rps $PG_INS_RPS)"  $PG_INS_MS
+printf "  %-14s  %10s  %6dms\n" "PG+PostgREST" "$(fmt_rps $PG_INS_RPS)"  $PG_INS_MS
 echo "  $(ratio_rps $LUX_INS_RPS $PG_INS_RPS)"
 
 # 2. SELECT *
 echo ""; echo -e "${BOLD}[2/5] GET all users (${ROWS} rows as JSON)${NC}"
 LUX_SCAN=$(curl_bench $ITERS "http://127.0.0.1:${LUX_HTTP}/v1/tables/users")
-PG_SCAN=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users")
+PG_SCAN=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?limit=${ROWS}")
 printf "  %-14s  %8sms\n" "Lux"          "$LUX_SCAN"
 printf "  %-14s  %8sms\n" "PG+PostgREST" "$PG_SCAN"
 echo "  $(ratio_ms $LUX_SCAN $PG_SCAN)"
@@ -138,7 +156,7 @@ echo "  $(ratio_ms $LUX_SCAN $PG_SCAN)"
 # 3. WHERE
 echo ""; echo -e "${BOLD}[3/5] WHERE age > 40${NC}"
 LUX_WHERE=$(curl_bench $ITERS "http://127.0.0.1:${LUX_HTTP}/v1/tables/users?where=age+>+40")
-PG_WHERE=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?age=gt.40")
+PG_WHERE=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?age=gt.40&limit=${ROWS}")
 printf "  %-14s  %8sms\n" "Lux"          "$LUX_WHERE"
 printf "  %-14s  %8sms\n" "PG+PostgREST" "$PG_WHERE"
 echo "  $(ratio_ms $LUX_WHERE $PG_WHERE)"
@@ -193,7 +211,7 @@ echo -e "${BOLD}| Benchmark             |        Lux | PG+PostgREST | Result    
 echo "|----------------------|------------|--------------|---------------------|"
 printf "| INSERT rows/s        | %8s | %8s     | %-19s |\n" \
     "$(fmt_rps $LUX_INS_RPS)" "$(fmt_rps $PG_INS_RPS)" "$(ratio_rps $LUX_INS_RPS $PG_INS_RPS)"
-printf "| SELECT * (full scan) | %7sms  | %8sms    | %-19s |\n" \
+printf "| SELECT * (100k rows) | %7sms  | %8sms    | %-19s |\n" \
     "$LUX_SCAN" "$PG_SCAN" "$(ratio_ms $LUX_SCAN $PG_SCAN)"
 printf "| WHERE age > 40       | %7sms  | %8sms    | %-19s |\n" \
     "$LUX_WHERE" "$PG_WHERE" "$(ratio_ms $LUX_WHERE $PG_WHERE)"

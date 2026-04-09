@@ -112,14 +112,14 @@ result "500 cold GETs: ${ELAPSED}ms (avg $(( ELAPSED / 500 ))ms/op, $COLD_OK/500
 section "Phase 6: Table queries"
 START=$(now_ms)
 for i in $(seq 1 50); do
-    redis-cli -h $HOST -p $PORT TQUERY users "WHERE age > 40 LIMIT 10" > /dev/null 2>&1
+    redis-cli -h $HOST -p $PORT TSELECT "*" FROM users WHERE age \> 40 LIMIT 10 > /dev/null 2>&1
 done
 END=$(now_ms)
 result "50x TQUERY (WHERE age > 40 LIMIT 10): $(( END - START ))ms total, $(( (END - START) / 50 ))ms avg"
 
 START=$(now_ms)
 for i in $(seq 1 50); do
-    redis-cli -h $HOST -p $PORT TQUERY users "WHERE name = 'user-$((RANDOM % 10000 + 1))' LIMIT 1" > /dev/null 2>&1
+    redis-cli -h $HOST -p $PORT TSELECT "*" FROM users WHERE name = "user-$((RANDOM % 10000 + 1))" LIMIT 1 > /dev/null 2>&1
 done
 END=$(now_ms)
 result "50x TQUERY (WHERE name = random LIMIT 1): $(( END - START ))ms total, $(( (END - START) / 50 ))ms avg"

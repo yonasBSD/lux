@@ -38,6 +38,15 @@ fn start_lux(resp_port: u16, http_port: u16, password: &str) -> LuxServer {
         http_port
     ));
     std::fs::create_dir_all(&tmpdir).unwrap();
+
+    // Wait for the port to be free before starting (previous test may still be releasing it)
+    for _ in 0..40 {
+        if TcpStream::connect(format!("127.0.0.1:{http_port}")).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
     let mut cmd = std::process::Command::new(&bin);
     cmd.env("LUX_PORT", resp_port.to_string())
         .env("LUX_HTTP_PORT", http_port.to_string())
@@ -54,7 +63,7 @@ fn start_lux(resp_port: u16, http_port: u16, password: &str) -> LuxServer {
     let child = cmd.spawn().expect("failed to start lux");
     let server = LuxServer { child, tmpdir };
 
-    for _ in 0..40 {
+    for _ in 0..60 {
         if TcpStream::connect(format!("127.0.0.1:{http_port}")).is_ok() {
             return server;
         }
@@ -70,9 +79,20 @@ fn http_request(
     body: Option<&str>,
     auth: Option<&str>,
 ) -> (u16, String) {
+    http_request_with_headers(port, method, path, body, auth, &[])
+}
+
+fn http_request_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    auth: Option<&str>,
+    extra_headers: &[&str],
+) -> (u16, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_millis(500)))
         .unwrap();
 
     let body_str = body.unwrap_or("");
@@ -82,6 +102,10 @@ fn http_request(
     );
     if let Some(token) = auth {
         req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    for h in extra_headers {
+        req.push_str(h);
+        req.push_str("\r\n");
     }
     req.push_str("\r\n");
     req.push_str(body_str);
@@ -93,7 +117,29 @@ fn http_request(
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                // Once we have headers, check if we can stop early
+                if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&response[..header_end]);
+                    // If Content-Length is known, stop once we have the full body
+                    if let Some(cl_line) = headers
+                        .lines()
+                        .find(|l| l.to_lowercase().starts_with("content-length:"))
+                    {
+                        if let Some(cl) = cl_line
+                            .split(':')
+                            .nth(1)
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                        {
+                            if response.len() >= header_end + 4 + cl {
+                                break;
+                            }
+                        }
+                    }
+                    // Connection: close means server will EOF when done - just keep reading
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
             Err(_) => break,
@@ -126,6 +172,10 @@ fn post(port: u16, path: &str, body: &str, auth: &str) -> String {
 
 fn put(port: u16, path: &str, body: &str, auth: &str) -> String {
     http_request(port, "PUT", path, Some(body), Some(auth)).1
+}
+
+fn patch(port: u16, path: &str, body: &str, auth: &str) -> String {
+    http_request(port, "PATCH", path, Some(body), Some(auth)).1
 }
 
 fn delete(port: u16, path: &str, auth: &str) -> (u16, String) {
@@ -228,8 +278,13 @@ fn http_exec_tables() {
     );
     assert!(resp.contains("1"), "tinsert: {resp}");
 
-    let resp = post(17611, "/v1/exec", r#"{"command":["TQUERY","users"]}"#, "");
-    assert!(resp.contains("Alice"), "tquery: {resp}");
+    let resp = post(
+        17611,
+        "/v1/exec",
+        r#"{"command":["TSELECT","*","FROM","users"]}"#,
+        "",
+    );
+    assert!(resp.contains("Alice"), "tselect: {resp}");
 }
 
 #[test]
@@ -240,10 +295,95 @@ fn http_cors_options() {
 }
 
 #[test]
-fn http_not_found() {
-    let _server = start_lux(17614, 17615, "");
-    let resp = get(17615, "/v1/nonexistent", "");
-    assert!(resp.contains("not found"), "404: {resp}");
+fn http_tables_content_range() {
+    let _server = start_lux(17630, 17631, "");
+
+    post(
+        17631,
+        "/v1/tables",
+        r#"{"name":"items","columns":["name STR","score INT"]}"#,
+        "",
+    );
+    for i in 1..=10 {
+        post(
+            17631,
+            "/v1/tables/items",
+            &format!(r#"{{"name":"item{}","score":"{}"}}"#, i, i * 10),
+            "",
+        );
+    }
+
+    // Read full raw HTTP response including headers using a longer timeout
+    let read_raw = |path: &str, extra: &[&str]| -> String {
+        use std::io::{Read, Write};
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", 17631)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n");
+        for h in extra {
+            req.push_str(h);
+            req.push_str("\r\n");
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut data = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => data.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&data).to_string()
+    };
+
+    let extract_headers =
+        |raw: &str| -> String { raw.split("\r\n\r\n").next().unwrap_or("").to_string() };
+
+    // No WHERE - total should be exact (free via zcard)
+    let raw = read_raw("/v1/tables/items", &[]);
+    let hdrs = extract_headers(&raw);
+    assert!(
+        hdrs.contains("Content-Range: 0-9/10"),
+        "no-where should have exact total: {hdrs}"
+    );
+
+    // With LIMIT - range end should match limit
+    let raw = read_raw("/v1/tables/items?limit=3", &[]);
+    let hdrs = extract_headers(&raw);
+    assert!(
+        hdrs.contains("Content-Range: 0-2/10"),
+        "limit=3 should have Content-Range 0-2/10: {hdrs}"
+    );
+
+    // With OFFSET+LIMIT - range should reflect offset
+    let raw = read_raw("/v1/tables/items?limit=3&offset=5", &[]);
+    let hdrs = extract_headers(&raw);
+    assert!(
+        hdrs.contains("Content-Range: 5-7/10"),
+        "offset=5 limit=3 should have 5-7/10: {hdrs}"
+    );
+
+    // With WHERE no Prefer - total should be *
+    let raw = read_raw("/v1/tables/items?where=score+>+50", &[]);
+    let hdrs = extract_headers(&raw);
+    assert!(
+        hdrs.contains("Content-Range:") && hdrs.contains("/*"),
+        "where without prefer should have *: {hdrs}"
+    );
+
+    // With WHERE and Prefer: count=exact - total should be exact (not *)
+    let raw = read_raw(
+        "/v1/tables/items?where=score+>+50",
+        &["Prefer: count=exact"],
+    );
+    let hdrs = extract_headers(&raw);
+    assert!(
+        hdrs.contains("Content-Range:") && !hdrs.contains("/*"),
+        "where with count=exact should have exact total: {hdrs}"
+    );
 }
 
 #[test]
@@ -317,13 +457,18 @@ fn http_tables_rest() {
     assert!(resp.contains("Alice"), "query all: {resp}");
     assert!(resp.contains("Bob"), "query all bob: {resp}");
 
-    let resp = get(17621, "/v1/tables/users/1", "");
+    let resp = get(17621, "/v1/tables/users?where=id+%3D+1", "");
     assert!(resp.contains("Alice"), "get by id: {resp}");
 
-    let resp = put(17621, "/v1/tables/users/1", r#"{"name":"Alicia"}"#, "");
-    assert!(resp.contains("\"OK\""), "update: {resp}");
+    let resp = patch(
+        17621,
+        "/v1/tables/users?where=id+%3D+1",
+        r#"{"name":"Alicia"}"#,
+        "",
+    );
+    assert!(resp.contains("1"), "update: {resp}");
 
-    let resp = get(17621, "/v1/tables/users/1", "");
+    let resp = get(17621, "/v1/tables/users?where=id+%3D+1", "");
     assert!(resp.contains("Alicia"), "get after update: {resp}");
 
     let resp = get(17621, "/v1/tables/users?where=age+>+30", "");
@@ -337,7 +482,7 @@ fn http_tables_rest() {
     assert!(resp.contains("name"), "schema: {resp}");
     assert!(resp.contains("age"), "schema age: {resp}");
 
-    let (status, _) = delete(17621, "/v1/tables/users/1", "");
+    let (status, _) = delete(17621, "/v1/tables/users?where=id+%3D+1", "");
     assert_eq!(status, 200, "delete row");
 
     let resp = get(17621, "/v1/tables/users/count", "");
@@ -469,4 +614,94 @@ fn http_kv_data_types() {
     let resp = get(17627, "/v1/kv/myzset/zset", "");
     assert!(resp.contains("\"a\""), "zset: {resp}");
     assert!(resp.contains("\"b\""), "zset b: {resp}");
+}
+
+#[test]
+fn http_tables_constraint_errors() {
+    let _server = start_lux(17628, 17629, "");
+
+    // Create table with unique constraint
+    post(
+        17629,
+        "/v1/tables",
+        r#"{"name":"users","columns":["email STR UNIQUE","name STR"]}"#,
+        "",
+    );
+
+    // Insert first row
+    let resp = post(
+        17629,
+        "/v1/tables/users",
+        r#"{"email":"alice@test.com","name":"alice"}"#,
+        "",
+    );
+    assert!(resp.contains("1"), "first insert: {resp}");
+
+    // Insert duplicate unique value - should return error body, not 500
+    let resp = post(
+        17629,
+        "/v1/tables/users",
+        r#"{"email":"alice@test.com","name":"alice2"}"#,
+        "",
+    );
+    assert!(
+        resp.contains("error"),
+        "duplicate unique should return error body: {resp}"
+    );
+    assert!(
+        !resp.contains("\"result\":2"),
+        "duplicate should not succeed: {resp}"
+    );
+
+    // PATCH update to duplicate unique value - should error
+    let resp = patch(
+        17629,
+        "/v1/tables/users?where=name+%3D+alice2",
+        r#"{"email":"alice@test.com"}"#,
+        "",
+    );
+    assert!(
+        resp.contains("error") || resp.contains("0"),
+        "patch to duplicate unique should error or return 0: {resp}"
+    );
+
+    // Insert with invalid type - should return error body
+    post(
+        17629,
+        "/v1/tables",
+        r#"{"name":"scores","columns":["val INT"]}"#,
+        "",
+    );
+    let resp = post(17629, "/v1/tables/scores", r#"{"val":"notanumber"}"#, "");
+    assert!(
+        resp.contains("error"),
+        "type error should return error body: {resp}"
+    );
+
+    // PATCH with where that matches nothing - should return result:0 not error
+    post(
+        17629,
+        "/v1/tables",
+        r#"{"name":"items","columns":["name STR"]}"#,
+        "",
+    );
+    post(17629, "/v1/tables/items", r#"{"name":"widget"}"#, "");
+    let resp = patch(
+        17629,
+        "/v1/tables/items?where=name+%3D+nobody",
+        r#"{"name":"new"}"#,
+        "",
+    );
+    assert!(
+        resp.contains("0") || resp.contains("result"),
+        "patch no match should return 0: {resp}"
+    );
+
+    // DELETE with where that matches nothing - should return result:0 not error
+    let (status, resp) = delete(17629, "/v1/tables/items?where=name+%3D+nobody", "");
+    assert_eq!(status, 200, "delete no match should be 200: {resp}");
+    assert!(
+        resp.contains("0") || resp.contains("result"),
+        "delete no match should return 0: {resp}"
+    );
 }

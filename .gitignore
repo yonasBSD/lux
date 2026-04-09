@@ -8,3 +8,4 @@ sdk/dist/
 
 # nix
 /result
+examples/*/node_modules/
