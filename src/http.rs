@@ -31,6 +31,7 @@ pub async fn start_http_server(
     broker: Broker,
     cache: SharedSchemaCache,
     max_rows: Option<usize>,
+    max_body: usize,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let socket = TcpSocket::new_v4()?;
@@ -47,7 +48,7 @@ pub async fn start_http_server(
 
         tokio::spawn(async move {
             let mut stream = socket;
-            while let Ok(true) = handle_request(&mut stream, &store, &broker, &cache, max_rows).await {}
+            while let Ok(true) = handle_request(&mut stream, &store, &broker, &cache, max_rows, max_body).await {}
         });
     }
 }
@@ -58,10 +59,10 @@ async fn handle_request(
     broker: &Broker,
     cache: &SharedSchemaCache,
     max_rows: Option<usize>,
+    max_body: usize,
 ) -> std::io::Result<bool> {
     // Hard limits to prevent memory exhaustion DoS
-    const MAX_HEADER_SIZE: usize = 64 * 1024;       // 64 KB headers
-    const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;  // 64 MB body
+    const MAX_HEADER_SIZE: usize = 64 * 1024; // 64 KB headers
 
     let mut buf = vec![0u8; 65536];
     let mut data = Vec::new();
@@ -93,7 +94,7 @@ async fn handle_request(
         .and_then(|(_, v)| v.trim().parse().ok())
         .unwrap_or(0);
 
-    if content_length > MAX_BODY_SIZE {
+    if content_length > max_body {
         let body = r#"{"error":"request body too large"}"#;
         return send_json(socket, 413, "Payload Too Large", body).await;
     }
@@ -218,20 +219,17 @@ async fn stream_table_query(
     let offset: usize = get_param(params, "offset").and_then(|s| s.parse().ok()).unwrap_or(0);
     let count_exact = prefer.contains("count=exact");
 
-    // Effective limit: client wins, else LUX_MAX_ROWS, else none
-    let effective_limit = client_limit.or(max_rows);
+    // Effective limit: client limit capped by LUX_MAX_ROWS (server always wins when set)
+    let effective_limit = match (client_limit, max_rows) {
+        (Some(c), Some(m)) => Some(c.min(m)),
+        (Some(c), None)    => Some(c),
+        (None,    Some(m)) => Some(m),
+        (None,    None)    => None,
+    };
 
     // Build select tokens
     let mut tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
     if let Some(w) = get_param(params, "where") {
-        // Reject injected TSELECT structural keywords to prevent pagination bypass
-        const FORBIDDEN: &[&str] = &["LIMIT", "OFFSET", "ORDER", "BY", "JOIN", "ON", "HAVING", "FROM", "SELECT"];
-        for part in w.split_whitespace() {
-            if FORBIDDEN.contains(&part.to_uppercase().as_str()) {
-                let body = format!(r#"{{"error":"forbidden keyword '{}' in where clause"}}"#, escape_json(part));
-                return send_json(socket, 400, "Bad Request", &body).await;
-            }
-        }
         tokens.push("WHERE".to_string());
         for p in w.split_whitespace() { tokens.push(p.to_string()); }
     }

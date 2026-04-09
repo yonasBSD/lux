@@ -113,12 +113,16 @@ async fn main() -> std::io::Result<()> {
         let max_rows: Option<usize> = std::env::var("LUX_MAX_ROWS")
             .ok()
             .and_then(|s| s.parse().ok());
+        let max_body: usize = std::env::var("LUX_MAX_BODY_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64 * 1024 * 1024); // default 64MB
         if http_port > 0 {
             let http_store = store.clone();
             let http_broker = broker.clone();
             let http_cache = schema_cache.clone();
             tokio::spawn(async move {
-                if let Err(e) = http::start_http_server(http_port, http_store, http_broker, http_cache, max_rows).await {
+                if let Err(e) = http::start_http_server(http_port, http_store, http_broker, http_cache, max_rows, max_body).await {
                     eprintln!("http server error: {e}");
                 }
             });
