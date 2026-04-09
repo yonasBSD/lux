@@ -59,6 +59,10 @@ async fn handle_request(
     cache: &SharedSchemaCache,
     max_rows: Option<usize>,
 ) -> std::io::Result<bool> {
+    // Hard limits to prevent memory exhaustion DoS
+    const MAX_HEADER_SIZE: usize = 64 * 1024;       // 64 KB headers
+    const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;  // 64 MB body
+
     let mut buf = vec![0u8; 65536];
     let mut data = Vec::new();
 
@@ -68,6 +72,11 @@ async fn handle_request(
             return Ok(false);
         }
         data.extend_from_slice(&buf[..n]);
+
+        if data.len() > MAX_HEADER_SIZE {
+            let body = r#"{"error":"request headers too large"}"#;
+            return send_json(socket, 431, "Request Header Fields Too Large", body).await;
+        }
 
         if data.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
@@ -83,6 +92,11 @@ async fn handle_request(
         .and_then(|l| l.split_once(':'))
         .and_then(|(_, v)| v.trim().parse().ok())
         .unwrap_or(0);
+
+    if content_length > MAX_BODY_SIZE {
+        let body = r#"{"error":"request body too large"}"#;
+        return send_json(socket, 413, "Payload Too Large", body).await;
+    }
 
     let total_needed = header_end + content_length;
     while data.len() < total_needed {
@@ -210,6 +224,14 @@ async fn stream_table_query(
     // Build select tokens
     let mut tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
     if let Some(w) = get_param(params, "where") {
+        // Reject injected TSELECT structural keywords to prevent pagination bypass
+        const FORBIDDEN: &[&str] = &["LIMIT", "OFFSET", "ORDER", "BY", "JOIN", "ON", "HAVING", "FROM", "SELECT"];
+        for part in w.split_whitespace() {
+            if FORBIDDEN.contains(&part.to_uppercase().as_str()) {
+                let body = format!(r#"{{"error":"forbidden keyword '{}' in where clause"}}"#, escape_json(part));
+                return send_json(socket, 400, "Bad Request", &body).await;
+            }
+        }
         tokens.push("WHERE".to_string());
         for p in w.split_whitespace() { tokens.push(p.to_string()); }
     }
@@ -1232,11 +1254,9 @@ fn push_escaped(out: &mut String, s: &str) {
 /// Returns true if s looks like a JSON number (integer or float).
 #[inline]
 fn looks_numeric(s: &str) -> bool {
-    if s.is_empty() { return false; }
-    let mut chars = s.chars();
-    let first = chars.next().unwrap();
-    if first != '-' && !first.is_ascii_digit() { return false; }
-    chars.all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')
+    // Only emit as a bare JSON number if it actually parses as one.
+    // This prevents invalid JSON for strings like "-", "1.2.3", "1e", "1-2".
+    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
 }
 
 fn exec_simple(store: &Arc<Store>, broker: &Broker, cache: &SharedSchemaCache, args: &[&str]) -> String {

@@ -590,7 +590,9 @@ fn encode_field_def(def: &FieldDef) -> String {
         parts.push(format!("ref:{}:{}:{}", fk.table, fk.column, on_delete));
     }
     if let Some(default) = &def.default_value {
-        parts.push(format!("default:{}", default));
+        // Escape | so it doesn't collide with the field separator
+        let escaped = default.replace('\\', "\\\\").replace('|', "\\|");
+        parts.push(format!("default:{}", escaped));
     }
     parts.join("|")
 }
@@ -642,7 +644,9 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
                 }
             }
             s if s.starts_with("default:") => {
-                default_value = Some(s[8..].to_string());
+                let raw = &s[8..];
+                let unescaped = raw.replace("\\|", "|").replace("\\\\", "\\");
+                default_value = Some(unescaped);
             }
             _ => {}
         }
@@ -1098,12 +1102,23 @@ pub fn table_update(
     field_values: &[(&str, &str)],
     now: Instant,
 ) -> Result<(), String> {
-    let schema = load_schema(store, cache, table, now)?;
-    let pk_str = id.to_string();
-    let rk = row_key_for_pk(table, &pk_str);
+    table_update_by_pk_str(store, cache, table, &id.to_string(), field_values, now)
+}
 
-    let old_row = get_row(store, table, &schema, &pk_str, now)
-        .ok_or_else(|| format!("ERR row {} not found in table '{}'", id, table))?;
+/// Update a row identified by its raw PK string - works for any PK type (INT, UUID, STR).
+fn table_update_by_pk_str(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    field_values: &[(&str, &str)],
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let rk = row_key_for_pk(table, pk_str);
+
+    let old_row = get_row(store, table, &schema, pk_str, now)
+        .ok_or_else(|| format!("ERR row '{}' not found in table '{}'", pk_str, table))?;
 
     let old_map: std::collections::HashMap<String, String> = old_row.into_iter().collect();
 
@@ -1184,22 +1199,41 @@ pub fn table_delete(
     id: i64,
     now: Instant,
 ) -> Result<(), String> {
+    table_delete_inner(store, cache, table, &id.to_string(), now, 0)
+}
+
+const CASCADE_DEPTH_LIMIT: usize = 16;
+
+fn table_delete_inner(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    now: Instant,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > CASCADE_DEPTH_LIMIT {
+        return Err(format!(
+            "ERR cascade depth limit ({}) exceeded - possible circular FK reference",
+            CASCADE_DEPTH_LIMIT
+        ));
+    }
     let schema = load_schema(store, cache, table, now)?;
-    let pk_str = id.to_string();
     let rk = row_key_for_pk(table, &pk_str);
 
     let row_map: std::collections::HashMap<String, String> =
-        get_row(store, table, &schema, &pk_str, now)
-            .ok_or_else(|| format!("ERR row {} not found in table '{}'", id, table))?
+        get_row(store, table, &schema, pk_str, now)
+            .ok_or_else(|| format!("ERR row '{}' not found in table '{}'", pk_str, table))?
             .into_iter()
             .collect();
 
     // The pk_value is the user-visible PK (may differ from internal pk_str for UUID/STR PKs)
     let pk_field = schema.iter().find(|f| f.primary_key);
-    let pk_value = pk_field
+    let pk_value_owned: String = pk_field
         .and_then(|pk| row_map.get(&pk.name))
         .cloned()
-        .unwrap_or_else(|| pk_str.clone());
+        .unwrap_or_else(|| pk_str.to_string());
+    let pk_value: &str = &pk_value_owned;
 
     let tlist_key = table_list_key();
     let all_tables = store
@@ -1219,7 +1253,7 @@ pub fn table_delete(
             if let FieldType::Ref(ref ref_table) = field.field_type {
                 if ref_table == table {
                     let zkey = idx_sorted_key(other_table, &field.name);
-                    let id_f = id as f64;
+                    let id_f = pk_str.parse::<f64>().unwrap_or(0.0);
                     let refs = store
                         .zrangebyscore(
                             zkey.as_bytes(),
@@ -1289,24 +1323,36 @@ pub fn table_delete(
                         ));
                     }
                     OnDelete::Cascade => {
-                        // Delete all referencing rows
+                        // Delete all referencing rows, passing depth+1 to detect circular FKs
                         for ref_id_str in &referencing_ids {
-                            if let Ok(ref_id) = ref_id_str.parse::<i64>() {
-                                let _ = table_delete(store, cache, other_table, ref_id, now);
-                            }
+                            let _ = table_delete_inner(
+                                store,
+                                cache,
+                                other_table,
+                                ref_id_str,
+                                now,
+                                depth + 1,
+                            );
                         }
                     }
                     OnDelete::SetNull => {
-                        // Null out the FK column in referencing rows
+                        // Null out the FK column in referencing rows and clean up its indexes
                         for ref_id_str in &referencing_ids {
-                            {
-                                let ref_rk = row_key_for_pk(other_table, ref_id_str);
-                                let _ =
-                                    store.hdel(ref_rk.as_bytes(), &[field.name.as_bytes()], now);
-                                let ref_ukey = uniq_key(other_table, &field.name);
-                                let _ =
-                                    store.hdel(ref_ukey.as_bytes(), &[pk_value.as_bytes()], now);
-                            }
+                            let ref_rk = row_key_for_pk(other_table, ref_id_str);
+                            // Remove the field value from the row hash
+                            let _ = store.hdel(ref_rk.as_bytes(), &[field.name.as_bytes()], now);
+                            // Clean up unique index if applicable
+                            let ref_ukey = uniq_key(other_table, &field.name);
+                            let _ = store.hdel(ref_ukey.as_bytes(), &[pk_value.as_bytes()], now);
+                            // Clean up sorted-set index (for INT/FLOAT FK columns)
+                            remove_from_index(
+                                store,
+                                other_table,
+                                field,
+                                pk_value,
+                                ref_id_str.as_str(),
+                                now,
+                            );
                         }
                     }
                 }
@@ -1448,13 +1494,22 @@ pub fn table_update_where(
             continue;
         }
 
-        // Parse the ID
-        let id: i64 = pk_str
-            .parse()
-            .map_err(|_| format!("ERR invalid row id '{}'", pk_str))?;
+        // table_update takes i64 - only valid for auto-increment (int) PKs.
+        // For UUID/STR PKs, update the row hash directly.
+        let has_int_pk = schema
+            .iter()
+            .any(|f| f.primary_key && f.field_type == FieldType::Int);
+        let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
 
-        // Update this row using the existing table_update logic
-        table_update(store, cache, table, id, field_values, now)?;
+        if has_int_pk || has_implicit_pk {
+            let id: i64 = pk_str
+                .parse()
+                .map_err(|_| format!("ERR invalid row id '{}'", pk_str))?;
+            table_update(store, cache, table, id, field_values, now)?;
+        } else {
+            // UUID/STR primary key - update directly
+            table_update_by_pk_str(store, cache, table, &pk_str, field_values, now)?;
+        }
         updated_count += 1;
     }
 
@@ -1487,8 +1542,8 @@ pub fn table_delete_where(
     let row_ids = get_all_row_ids(store, table, now);
     let mut deleted_count = 0i64;
 
-    // Collect IDs to delete first (to avoid modifying while iterating)
-    let mut ids_to_delete: Vec<i64> = Vec::new();
+    // Collect PKs to delete first (to avoid modifying while iterating)
+    let mut pks_to_delete: Vec<String> = Vec::new();
 
     for pk_str in row_ids {
         let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
@@ -1497,16 +1552,13 @@ pub fn table_delete_where(
         let row_map: std::collections::HashMap<String, String> = row.into_iter().collect();
 
         if row_matches_conditions(&row_map, &conditions) {
-            let id: i64 = pk_str
-                .parse()
-                .map_err(|_| format!("ERR invalid row id '{}'", pk_str))?;
-            ids_to_delete.push(id);
+            pks_to_delete.push(pk_str);
         }
     }
 
-    // Now delete them
-    for id in ids_to_delete {
-        table_delete(store, cache, table, id, now)?;
+    // Now delete them - works for any PK type (int, uuid, str)
+    for pk_str in pks_to_delete {
+        table_delete_inner(store, cache, table, &pk_str, now, 0)?;
         deleted_count += 1;
     }
 
@@ -1734,11 +1786,22 @@ pub fn table_drop_column(
         let _ = store.hdel(rk.as_bytes(), &[field_name.as_bytes()], now);
     }
 
+    // Drop the numeric sorted-set index (INT/FLOAT/TIMESTAMP fields)
     let idx_key = idx_sorted_key(table, field_name);
     store.del(&[idx_key.as_bytes()]);
 
+    // Drop the unique hash index
     let ukey = uniq_key(table, field_name);
     store.del(&[ukey.as_bytes()]);
+
+    // Drop all per-value set index keys (STR/UUID fields store one key per distinct value)
+    // Pattern: _t:<table>:idx:<field>:*
+    let str_idx_pattern = format!("_t:{}:idx:{}:*", table, field_name);
+    let keys = store.keys(str_idx_pattern.as_bytes(), now);
+    if !keys.is_empty() {
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes() as &[u8]).collect();
+        store.del(&key_refs);
+    }
 
     // Invalidate so the next load picks up the dropped field from the Store
     cache.write().remove(table);
