@@ -1938,6 +1938,7 @@ fn candidates_from_index(
     table: &str,
     cond: &WhereClause,
     field_def: &FieldDef,
+    limit: Option<usize>,
     now: Instant,
 ) -> Option<Vec<String>> {
     match &field_def.field_type {
@@ -1945,6 +1946,11 @@ fn candidates_from_index(
             if cond.op == CmpOp::Eq {
                 let skey = idx_str_key(table, &cond.field, &cond.value);
                 let members = store.smembers(skey.as_bytes(), now).unwrap_or_default();
+                // Apply limit if set - STR equality index returns exact matches only
+                let members = match limit {
+                    Some(n) => members.into_iter().take(n).collect(),
+                    None => members,
+                };
                 return Some(members);
             }
             None
@@ -1967,6 +1973,8 @@ fn candidates_from_index(
                 CmpOp::Le => (f64::NEG_INFINITY, score, false, false),
                 CmpOp::Ne => return None,
             };
+            // Pass limit directly to zrangebyscore - avoids fetching all matching IDs
+            // when we only need the first N (e.g. WHERE age > 40 LIMIT 100)
             let results = store
                 .zrangebyscore(
                     zkey.as_bytes(),
@@ -1975,8 +1983,8 @@ fn candidates_from_index(
                     min_excl,
                     max_excl,
                     false,
-                    None,
-                    None,
+                    Some(0),
+                    limit,
                     false,
                     now,
                 )
@@ -2376,9 +2384,6 @@ pub fn table_select(
         .map(|f| (f.name.as_str(), &f.field_type))
         .collect();
 
-    // Apply LIMIT early when there are no joins - avoids fetching rows we'll
-    // just discard later.
-    let mut candidates = build_candidates(store, &plan.table, &schema, &conditions, now);
     // Apply LIMIT early only when safe to do so:
     // - no joins (join changes the row count unpredictably)
     // - no ORDER BY (ordering requires all rows before truncating)
@@ -2387,6 +2392,12 @@ pub fn table_select(
     } else {
         None
     };
+
+    // Pass early_limit into build_candidates so index lookups stop after N results
+    // rather than fetching all matching IDs first (e.g. WHERE age > 40 LIMIT 100
+    // used to fetch 61k IDs from the sorted set before truncating to 100)
+    let mut candidates =
+        build_candidates(store, &plan.table, &schema, &conditions, early_limit, now);
     if let Some(lim) = early_limit {
         candidates.truncate(lim);
     }
@@ -2530,9 +2541,14 @@ fn build_candidates(
     table: &str,
     schema: &[FieldDef],
     conditions: &[WhereClause],
+    limit: Option<usize>,
     now: Instant,
 ) -> Vec<String> {
     let mut candidate_set: Option<HashSet<String>> = None;
+
+    // Only push limit down to index when there's a single condition - with multiple
+    // conditions we need the full set from each index to intersect correctly.
+    let index_limit = if conditions.len() == 1 { limit } else { None };
 
     for cond in conditions {
         let bare = bare_col(&cond.field);
@@ -2546,6 +2562,7 @@ fn build_candidates(
                     value: cond.value.clone(),
                 },
                 fd,
+                index_limit,
                 now,
             ) {
                 let pk_set: HashSet<String> = pks.into_iter().collect();
@@ -2769,7 +2786,8 @@ fn try_fast_aggregate(
                     store.zcard(ids_key(table).as_bytes(), now).unwrap_or(0)
                 } else {
                     // COUNT(*) with WHERE - use index to get candidates, count them
-                    let candidates = build_candidates(store, table, schema, conditions, now);
+                    // No limit here - COUNT needs the full matching set
+                    let candidates = build_candidates(store, table, schema, conditions, None, now);
                     candidates.len() as i64
                 };
                 result.push((agg.alias.clone(), count.to_string()));

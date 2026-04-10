@@ -145,24 +145,42 @@ printf "  %-14s  %10s  %6dms\n" "Lux"         "$(fmt_rps $LUX_INS_RPS)" $LUX_INS
 printf "  %-14s  %10s  %6dms\n" "PG+PostgREST" "$(fmt_rps $PG_INS_RPS)"  $PG_INS_MS
 echo "  $(ratio_rps $LUX_INS_RPS $PG_INS_RPS)"
 
-# 2. SELECT *
-echo ""; echo -e "${BOLD}[2/5] GET all users (${ROWS} rows as JSON)${NC}"
+# 2. Point lookup by ID
+echo ""; echo -e "${BOLD}[2/7] Point lookup (WHERE id = 50000)${NC}"
+LUX_POINT=$(curl_bench $ITERS "http://127.0.0.1:${LUX_HTTP}/v1/tables/users?where=id+%3D+50000")
+PG_POINT=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?id=eq.50000")
+printf "  %-14s  %8sms\n" "Lux"          "$LUX_POINT"
+printf "  %-14s  %8sms\n" "PG+PostgREST" "$PG_POINT"
+echo "  $(ratio_ms $LUX_POINT $PG_POINT)"
+
+# 3. Filtered query with small result set
+echo ""; echo -e "${BOLD}[3/7] WHERE age > 40 LIMIT 100${NC}"
+LUX_FILTER=$(curl_bench $ITERS "http://127.0.0.1:${LUX_HTTP}/v1/tables/users?where=age+>+40&limit=100")
+PG_FILTER=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?age=gt.40&limit=100")
+printf "  %-14s  %8sms\n" "Lux"          "$LUX_FILTER"
+printf "  %-14s  %8sms\n" "PG+PostgREST" "$PG_FILTER"
+echo "  $(ratio_ms $LUX_FILTER $PG_FILTER)"
+
+# 4. SELECT * (full scan - noted as pathological case)
+echo ""; echo -e "${BOLD}[4/7] GET all users (${ROWS} rows - full scan, no limit)${NC}"
+echo -e "${YELLOW}  Note: Lux stores rows as individual hashes (needed for row-level pub/sub).${NC}"
+echo -e "${YELLOW}  Full scans require N hash lookups vs Postgres sequential scan.${NC}"
 LUX_SCAN=$(curl_bench $ITERS "http://127.0.0.1:${LUX_HTTP}/v1/tables/users")
 PG_SCAN=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?limit=${ROWS}")
 printf "  %-14s  %8sms\n" "Lux"          "$LUX_SCAN"
 printf "  %-14s  %8sms\n" "PG+PostgREST" "$PG_SCAN"
 echo "  $(ratio_ms $LUX_SCAN $PG_SCAN)"
 
-# 3. WHERE
-echo ""; echo -e "${BOLD}[3/5] WHERE age > 40${NC}"
+# 5. WHERE no limit (large result)
+echo ""; echo -e "${BOLD}[5/7] WHERE age > 40 (no limit, ~61k rows)${NC}"
 LUX_WHERE=$(curl_bench $ITERS "http://127.0.0.1:${LUX_HTTP}/v1/tables/users?where=age+>+40")
 PG_WHERE=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?age=gt.40&limit=${ROWS}")
 printf "  %-14s  %8sms\n" "Lux"          "$LUX_WHERE"
 printf "  %-14s  %8sms\n" "PG+PostgREST" "$PG_WHERE"
 echo "  $(ratio_ms $LUX_WHERE $PG_WHERE)"
 
-# 4. COUNT
-echo ""; echo -e "${BOLD}[4/5] COUNT (aggregate)${NC}"
+# 6. COUNT
+echo ""; echo -e "${BOLD}[6/7] COUNT (aggregate)${NC}"
 LUX_COUNT=$(curl_bench $ITERS "http://127.0.0.1:${LUX_HTTP}/v1/tables/users/count")
 PG_COUNT=$(curl_bench  $ITERS "http://127.0.0.1:${PGRST_PORT}/users?select=count")
 printf "  %-14s  %8sms\n" "Lux"          "$LUX_COUNT"
@@ -170,7 +188,7 @@ printf "  %-14s  %8sms\n" "PG+PostgREST" "$PG_COUNT"
 echo "  $(ratio_ms $LUX_COUNT $PG_COUNT)"
 
 # 5. JOIN
-echo ""; echo -e "${BOLD}[5/5] JOIN + LIMIT 1000${NC}"
+echo ""; echo -e "${BOLD}[7/7] JOIN + LIMIT 1000${NC}"
 echo "  Seeding ${JOIN_ROWS} orders..."
 python3 - << PYEOF
 import socket
@@ -207,17 +225,24 @@ echo -e "${BOLD}=== Summary: Lux vs PostgreSQL 16 + PostgREST (HTTP/JSON) ===${N
 echo -e "${YELLOW}Same wire format (JSON over HTTP). Median of ${ITERS} curl requests.${NC}"
 echo -e "${YELLOW}Postgres: ACID, fsync=off. Lux: in-memory.${NC}"
 echo ""
-echo -e "${BOLD}| Benchmark             |        Lux | PG+PostgREST | Result              |${NC}"
-echo "|----------------------|------------|--------------|---------------------|"
-printf "| INSERT rows/s        | %8s | %8s     | %-19s |\n" \
+echo -e "${BOLD}| Benchmark                  |       Lux | PG+PostgREST | Result              |${NC}"
+echo "|---------------------------|-----------|--------------|---------------------|"
+printf "| INSERT rows/s             | %7s | %8s     | %-19s |\n" \
     "$(fmt_rps $LUX_INS_RPS)" "$(fmt_rps $PG_INS_RPS)" "$(ratio_rps $LUX_INS_RPS $PG_INS_RPS)"
-printf "| SELECT * (100k rows) | %7sms  | %8sms    | %-19s |\n" \
-    "$LUX_SCAN" "$PG_SCAN" "$(ratio_ms $LUX_SCAN $PG_SCAN)"
-printf "| WHERE age > 40       | %7sms  | %8sms    | %-19s |\n" \
-    "$LUX_WHERE" "$PG_WHERE" "$(ratio_ms $LUX_WHERE $PG_WHERE)"
-printf "| COUNT(*)             | %7sms  | %8sms    | %-19s |\n" \
+printf "| Point lookup (1 row)      | %6sms  | %8sms    | %-19s |\n" \
+    "$LUX_POINT" "$PG_POINT" "$(ratio_ms $LUX_POINT $PG_POINT)"
+printf "| WHERE+LIMIT 100           | %6sms  | %8sms    | %-19s |\n" \
+    "$LUX_FILTER" "$PG_FILTER" "$(ratio_ms $LUX_FILTER $PG_FILTER)"
+printf "| COUNT(*)                  | %6sms  | %8sms    | %-19s |\n" \
     "$LUX_COUNT" "$PG_COUNT" "$(ratio_ms $LUX_COUNT $PG_COUNT)"
-printf "| JOIN LIMIT 1000      | %7sms  | %8sms    | %-19s |\n" \
+printf "| JOIN LIMIT 1000           | %6sms  | %8sms    | %-19s |\n" \
     "$LUX_JOIN" "$PG_JOIN" "$(ratio_ms $LUX_JOIN $PG_JOIN)"
+printf "| Full scan (100k rows)     | %6sms  | %8sms    | %-19s |\n" \
+    "$LUX_SCAN" "$PG_SCAN" "$(ratio_ms $LUX_SCAN $PG_SCAN)"
+printf "| WHERE no limit (~61k rows)| %6sms  | %8sms    | %-19s |\n" \
+    "$LUX_WHERE" "$PG_WHERE" "$(ratio_ms $LUX_WHERE $PG_WHERE)"
+echo ""
+echo -e "${YELLOW}  * Full scan and large WHERE are pathological for Lux's hash-per-row storage model${NC}"
+echo -e "${YELLOW}    (required for row-level pub/sub). Use LUX_MAX_ROWS to prevent in production.${NC}"
 echo ""
 echo -e "${GREEN}Done.${NC}"
