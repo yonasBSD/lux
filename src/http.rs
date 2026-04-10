@@ -332,8 +332,7 @@ async fn stream_table_query(
                  Content-Type: application/json\r\n\
                  Transfer-Encoding: chunked\r\n\
                  Content-Range: {content_range}\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Connection: close\r\n\r\n"
+                 Access-Control-Allow-Origin: *\r\n\r\n"
             );
             socket.write_all(header.as_bytes()).await?;
 
@@ -367,8 +366,8 @@ async fn stream_table_query(
             buf.push_str("]}");
             write_chunk(socket, buf.as_bytes()).await?;
             socket.write_all(b"0\r\n\r\n").await?;
-            // Chunked responses close the connection - client reads until EOF
-            return Ok(false);
+            // Chunked response complete - keep connection alive for next request
+            return Ok(true);
         }
     }
 

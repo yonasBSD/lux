@@ -119,10 +119,9 @@ fn http_request_with_headers(
             Ok(0) => break,
             Ok(n) => {
                 response.extend_from_slice(&buf[..n]);
-                // Once we have headers, check if we can stop early
                 if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&response[..header_end]);
-                    // If Content-Length is known, stop once we have the full body
+                    // Content-Length: stop once we have full body
                     if let Some(cl_line) = headers
                         .lines()
                         .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -137,7 +136,15 @@ fn http_request_with_headers(
                             }
                         }
                     }
-                    // Connection: close means server will EOF when done - just keep reading
+                    // Chunked: stop when we see the terminal chunk "0\r\n\r\n"
+                    if headers
+                        .to_lowercase()
+                        .contains("transfer-encoding: chunked")
+                    {
+                        if response.windows(5).any(|w| w == b"0\r\n\r\n") {
+                            break;
+                        }
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
