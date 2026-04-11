@@ -246,6 +246,10 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
          \r\n\
          # Stats\r\n\
          total_commands_processed:{}\r\n\
+         key_events_enqueued:{}\r\n\
+         key_events_dropped:{}\r\n\
+         key_events_emitted:{}\r\n\
+         key_events_coalesced:{}\r\n\
          \r\n\
          # Memory\r\n\
          used_memory_bytes:{}\r\n\
@@ -269,6 +273,10 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
         uptime,
         CONNECTED_CLIENTS.load(Ordering::Relaxed),
         TOTAL_COMMANDS.load(Ordering::Relaxed),
+        crate::pubsub::KEY_EVENTS_ENQUEUED.load(Ordering::Relaxed),
+        crate::pubsub::KEY_EVENTS_DROPPED.load(Ordering::Relaxed),
+        crate::pubsub::KEY_EVENTS_EMITTED.load(Ordering::Relaxed),
+        crate::pubsub::KEY_EVENTS_COALESCED.load(Ordering::Relaxed),
         store.approximate_memory(),
         if crate::disk::storage_config().mode == crate::disk::StorageMode::Tiered {
             "tiered"

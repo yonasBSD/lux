@@ -1,15 +1,22 @@
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 type KeySubMap = Vec<(String, broadcast::Sender<Message>)>;
+type KeyExactSubMap = HashMap<String, broadcast::Sender<Message>>;
 type KeyEvent = (Box<[u8]>, Box<[u8]>);
 
 const CHANNEL_CAPACITY: usize = 1024;
 const KEY_EVENT_QUEUE_CAPACITY: usize = 65536;
+
+pub static KEY_EVENTS_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+pub static KEY_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+pub static KEY_EVENTS_EMITTED: AtomicU64 = AtomicU64::new(0);
+pub static KEY_EVENTS_COALESCED: AtomicU64 = AtomicU64::new(0);
 
 pub struct BlockedPopRequest {
     pub tx: mpsc::Sender<(String, Bytes)>,
@@ -21,10 +28,14 @@ pub struct BlockedPopRequest {
 pub struct Broker {
     channels: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
     pattern_subs: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
-    key_subs: Arc<parking_lot::RwLock<Arc<KeySubMap>>>,
+    key_exact_subs: Arc<parking_lot::RwLock<Arc<KeyExactSubMap>>>,
+    key_glob_subs: Arc<parking_lot::RwLock<Arc<KeySubMap>>>,
     key_sub_count: Arc<AtomicU64>,
     key_event_tx: mpsc::Sender<KeyEvent>,
     key_event_rx: Arc<parking_lot::Mutex<Option<mpsc::Receiver<KeyEvent>>>>,
+    key_worker_txs: Arc<Vec<mpsc::UnboundedSender<KeyEvent>>>,
+    key_worker_rxs: Arc<parking_lot::Mutex<Option<Vec<mpsc::UnboundedReceiver<KeyEvent>>>>>,
+    key_event_overflow: Arc<parking_lot::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
     list_waiters: Arc<parking_lot::Mutex<HashMap<String, VecDeque<BlockedPopRequest>>>>,
     list_waiter_count: Arc<AtomicU64>,
     stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>>,
@@ -48,13 +59,27 @@ pub struct Message {
 impl Broker {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(KEY_EVENT_QUEUE_CAPACITY);
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8))
+            .unwrap_or(4);
+        let mut worker_txs = Vec::with_capacity(worker_count);
+        let mut worker_rxs = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (wtx, wrx) = mpsc::unbounded_channel();
+            worker_txs.push(wtx);
+            worker_rxs.push(wrx);
+        }
         Self {
             channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             pattern_subs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            key_subs: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
+            key_exact_subs: Arc::new(parking_lot::RwLock::new(Arc::new(HashMap::new()))),
+            key_glob_subs: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
             key_sub_count: Arc::new(AtomicU64::new(0)),
             key_event_tx: tx,
             key_event_rx: Arc::new(parking_lot::Mutex::new(Some(rx))),
+            key_worker_txs: Arc::new(worker_txs),
+            key_worker_rxs: Arc::new(parking_lot::Mutex::new(Some(worker_rxs))),
+            key_event_overflow: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             list_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             list_waiter_count: Arc::new(AtomicU64::new(0)),
             stream_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -199,24 +224,63 @@ impl Broker {
     }
 
     pub fn ksubscribe(&self, pattern: &str) -> broadcast::Receiver<Message> {
-        let mut subs = self.key_subs.write();
+        if is_glob_pattern(pattern) {
+            let mut subs = self.key_glob_subs.write();
+            let inner = Arc::make_mut(&mut subs);
+            if let Some((_, tx)) = inner.iter().find(|(p, _)| p == pattern) {
+                return tx.subscribe();
+            }
+            let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
+            inner.push((pattern.to_string(), tx));
+            let exact_len = self.key_exact_subs.read().len();
+            self.key_sub_count
+                .store((exact_len + inner.len()) as u64, Ordering::Release);
+            return rx;
+        }
+
+        let mut subs = self.key_exact_subs.write();
         let inner = Arc::make_mut(&mut subs);
-        if let Some((_, tx)) = inner.iter().find(|(p, _)| p == pattern) {
+        if let Some(tx) = inner.get(pattern) {
             return tx.subscribe();
         }
         let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
-        inner.push((pattern.to_string(), tx));
+        inner.insert(pattern.to_string(), tx);
+        let glob_len = self.key_glob_subs.read().len();
         self.key_sub_count
-            .store(inner.len() as u64, Ordering::Release);
+            .store((inner.len() + glob_len) as u64, Ordering::Release);
         rx
     }
 
     pub fn kunsub(&self, pattern: &str) {
-        let mut subs = self.key_subs.write();
+        if is_glob_pattern(pattern) {
+            let mut subs = self.key_glob_subs.write();
+            let inner = Arc::make_mut(&mut subs);
+            inner.retain(|(p, tx)| {
+                if p != pattern {
+                    return true;
+                }
+                tx.receiver_count() > 0
+            });
+            let exact_len = self.key_exact_subs.read().len();
+            self.key_sub_count
+                .store((exact_len + inner.len()) as u64, Ordering::Release);
+            return;
+        }
+
+        let mut subs = self.key_exact_subs.write();
         let inner = Arc::make_mut(&mut subs);
-        inner.retain(|(p, _)| p != pattern);
+        if let Some(tx) = inner.get(pattern) {
+            if tx.receiver_count() > 0 {
+                let glob_len = self.key_glob_subs.read().len();
+                self.key_sub_count
+                    .store((inner.len() + glob_len) as u64, Ordering::Release);
+                return;
+            }
+        }
+        inner.remove(pattern);
+        let glob_len = self.key_glob_subs.read().len();
         self.key_sub_count
-            .store(inner.len() as u64, Ordering::Release);
+            .store((inner.len() + glob_len) as u64, Ordering::Release);
     }
 
     #[inline(always)]
@@ -229,16 +293,77 @@ impl Broker {
         if self.key_sub_count.load(Ordering::Relaxed) == 0 {
             return;
         }
-        let _ = self.key_event_tx.try_send((key.into(), cmd.into()));
+        KEY_EVENTS_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        match self.key_event_tx.try_send((key.into(), cmd.into())) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full((k, c))) => {
+                let mut overflow = self.key_event_overflow.lock();
+                overflow.insert(k.into_vec(), c.into_vec());
+                KEY_EVENTS_COALESCED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                KEY_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn pop_overflow_event(&self) -> Option<KeyEvent> {
+        let mut overflow = self.key_event_overflow.lock();
+        let key = overflow.keys().next()?.clone();
+        let cmd = overflow.remove(&key)?;
+        Some((key.into_boxed_slice(), cmd.into_boxed_slice()))
+    }
+
+    #[inline(always)]
+    fn key_worker_index(&self, key: &[u8]) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.key_worker_txs.len()
+    }
+
+    #[inline(always)]
+    fn dispatch_key_event(&self, key: Box<[u8]>, cmd: Box<[u8]>) {
+        let index = self.key_worker_index(&key);
+        if self.key_worker_txs[index].send((key, cmd)).is_err() {
+            KEY_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn process_key_event(&self, key: &[u8], cmd: &[u8]) {
+        let exact_snap = self.key_exact_subs.read().clone();
+        let glob_snap = self.key_glob_subs.read().clone();
+        if exact_snap.is_empty() && glob_snap.is_empty() {
+            return;
+        }
+        if let Ok(key_str) = std::str::from_utf8(key) {
+            Self::emit_key_event(exact_snap.as_ref(), glob_snap.as_ref(), key_str, cmd);
+        }
     }
 
     pub fn take_key_event_rx(&self) -> Option<mpsc::Receiver<KeyEvent>> {
         self.key_event_rx.lock().take()
     }
 
-    fn emit_key_event(subs: &[(String, broadcast::Sender<Message>)], key: &str, cmd: &[u8]) {
+    fn emit_key_event(
+        exact_subs: &KeyExactSubMap,
+        glob_subs: &[(String, broadcast::Sender<Message>)],
+        key: &str,
+        cmd: &[u8],
+    ) {
         let mut op: Option<String> = None;
-        for (pat, tx) in subs.iter() {
+        if let Some(tx) = exact_subs.get(key) {
+            let operation = op
+                .get_or_insert_with(|| std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase());
+            let msg = Message {
+                channel: key.to_string(),
+                payload: operation.clone(),
+                pattern: Some(key.to_string()),
+                kind: MessageKind::KeyEvent,
+            };
+            let _ = tx.send(msg);
+            KEY_EVENTS_EMITTED.fetch_add(1, Ordering::Relaxed);
+        }
+        for (pat, tx) in glob_subs.iter() {
             if glob_match(pat, key) {
                 let operation = op.get_or_insert_with(|| {
                     std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase()
@@ -250,6 +375,7 @@ impl Broker {
                     kind: MessageKind::KeyEvent,
                 };
                 let _ = tx.send(msg);
+                KEY_EVENTS_EMITTED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -259,16 +385,45 @@ impl Broker {
             Some(rx) => rx,
             None => return,
         };
-        while let Some((key, cmd)) = rx.recv().await {
-            let snap = self.key_subs.read().clone();
-            if snap.is_empty() {
-                continue;
+        if let Some(worker_rxs) = self.key_worker_rxs.lock().take() {
+            for mut worker_rx in worker_rxs {
+                let broker = self.clone();
+                tokio::spawn(async move {
+                    while let Some((key, cmd)) = worker_rx.recv().await {
+                        broker.process_key_event(&key, &cmd);
+                    }
+                });
             }
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                Self::emit_key_event(&snap, key_str, &cmd);
+        }
+        let mut overflow_tick = tokio::time::interval(std::time::Duration::from_millis(2));
+        overflow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    let Some((key, cmd)) = maybe else {
+                        break;
+                    };
+                    self.dispatch_key_event(key, cmd);
+                }
+                _ = overflow_tick.tick() => {
+                    let mut drained = 0;
+                    while drained < 1024 {
+                        let Some((key, cmd)) = self.pop_overflow_event() else {
+                            break;
+                        };
+                        self.dispatch_key_event(key, cmd);
+                        drained += 1;
+                    }
+                }
             }
         }
     }
+}
+
+#[inline(always)]
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
 }
 
 fn glob_match(pattern: &str, s: &str) -> bool {
@@ -387,5 +542,25 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().payload, "first");
         assert_eq!(rx.try_recv().unwrap().payload, "second");
         assert_eq!(rx.try_recv().unwrap().payload, "third");
+    }
+
+    #[test]
+    fn kunsub_keeps_pattern_while_other_receivers_exist() {
+        let broker = Broker::new();
+        let rx1 = broker.ksubscribe("table:users");
+        let mut rx2 = broker.ksubscribe("table:users");
+
+        drop(rx1);
+        broker.kunsub("table:users");
+
+        Broker::emit_key_event(
+            broker.key_exact_subs.read().as_ref(),
+            broker.key_glob_subs.read().as_ref(),
+            "table:users",
+            b"set",
+        );
+
+        assert_eq!(rx2.try_recv().unwrap().channel, "table:users");
+        assert_eq!(rx2.try_recv().err(), Some(broadcast::error::TryRecvError::Empty));
     }
 }
