@@ -31,6 +31,32 @@ pub static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_COMMANDS: AtomicUsize = AtomicUsize::new(0);
 pub static START_TIME: OnceLock<Instant> = OnceLock::new();
 static SCRIPT_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+const SUB_MODE_BATCH_MAX: usize = 64;
+
+async fn recv_broadcast_batch(
+    rx: &mut broadcast::Receiver<pubsub::Message>,
+    max_batch: usize,
+) -> Option<Vec<pubsub::Message>> {
+    let first = loop {
+        match rx.recv().await {
+            Ok(msg) => break msg,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
+    };
+
+    let mut batch = Vec::with_capacity(max_batch.min(8));
+    batch.push(first);
+    while batch.len() < max_batch {
+        match rx.try_recv() {
+            Ok(msg) => batch.push(msg),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    Some(batch)
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -567,60 +593,75 @@ async fn handle_connection(
                     }
                 }
                 msg = async {
+                    let total_subs = subscriptions.len() + pattern_subs.len() + key_subs.len();
+                    if total_subs == 1 {
+                        if let Some((_ch, rx)) = subscriptions.iter_mut().next() {
+                            return recv_broadcast_batch(rx, SUB_MODE_BATCH_MAX).await;
+                        }
+                        if let Some((_pat, rx)) = pattern_subs.iter_mut().next() {
+                            return recv_broadcast_batch(rx, SUB_MODE_BATCH_MAX).await;
+                        }
+                        if let Some((_pat, rx)) = key_subs.iter_mut().next() {
+                            return recv_broadcast_batch(rx, SUB_MODE_BATCH_MAX).await;
+                        }
+                    }
+
                     for (_ch, rx) in subscriptions.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
-                            return Some(msg);
+                            return Some(vec![msg]);
                         }
                     }
                     for (_pat, rx) in pattern_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
-                            return Some(msg);
+                            return Some(vec![msg]);
                         }
                     }
                     for (_pat, rx) in key_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
-                            return Some(msg);
+                            return Some(vec![msg]);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     for (_ch, rx) in subscriptions.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
-                            return Some(msg);
+                            return Some(vec![msg]);
                         }
                     }
                     for (_pat, rx) in pattern_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
-                            return Some(msg);
+                            return Some(vec![msg]);
                         }
                     }
                     for (_pat, rx) in key_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
-                            return Some(msg);
+                            return Some(vec![msg]);
                         }
                     }
                     None
                 } => {
-                    if let Some(msg) = msg {
-                        match msg.kind {
-                            pubsub::MessageKind::KeyEvent => {
-                                resp::write_array_header(&mut write_buf, 4);
-                                resp::write_bulk(&mut write_buf, "kmessage");
-                                resp::write_bulk(&mut write_buf, msg.pattern.as_deref().unwrap_or(""));
-                                resp::write_bulk(&mut write_buf, &msg.channel);
-                                resp::write_bulk(&mut write_buf, &msg.payload);
-                            }
-                            pubsub::MessageKind::PubSub => {
-                                if let Some(ref pat) = msg.pattern {
+                    if let Some(msgs) = msg {
+                        for msg in msgs {
+                            match msg.kind {
+                                pubsub::MessageKind::KeyEvent => {
                                     resp::write_array_header(&mut write_buf, 4);
-                                    resp::write_bulk(&mut write_buf, "pmessage");
-                                    resp::write_bulk(&mut write_buf, pat);
+                                    resp::write_bulk(&mut write_buf, "kmessage");
+                                    resp::write_bulk(&mut write_buf, msg.pattern.as_deref().unwrap_or(""));
                                     resp::write_bulk(&mut write_buf, &msg.channel);
                                     resp::write_bulk(&mut write_buf, &msg.payload);
-                                } else {
-                                    resp::write_array_header(&mut write_buf, 3);
-                                    resp::write_bulk(&mut write_buf, "message");
-                                    resp::write_bulk(&mut write_buf, &msg.channel);
-                                    resp::write_bulk(&mut write_buf, &msg.payload);
+                                }
+                                pubsub::MessageKind::PubSub => {
+                                    if let Some(ref pat) = msg.pattern {
+                                        resp::write_array_header(&mut write_buf, 4);
+                                        resp::write_bulk(&mut write_buf, "pmessage");
+                                        resp::write_bulk(&mut write_buf, pat);
+                                        resp::write_bulk(&mut write_buf, &msg.channel);
+                                        resp::write_bulk(&mut write_buf, &msg.payload);
+                                    } else {
+                                        resp::write_array_header(&mut write_buf, 3);
+                                        resp::write_bulk(&mut write_buf, "message");
+                                        resp::write_bulk(&mut write_buf, &msg.channel);
+                                        resp::write_bulk(&mut write_buf, &msg.payload);
+                                    }
                                 }
                             }
                         }
