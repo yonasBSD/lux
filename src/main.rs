@@ -69,9 +69,8 @@ async fn main() -> std::io::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).await?;
     let store = Arc::new(Store::new());
-    let schema_cache: SharedSchemaCache = std::sync::Arc::new(parking_lot::RwLock::new(
-        tables::SchemaCache::new(),
-    ));
+    let schema_cache: SharedSchemaCache =
+        std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
     if disk::storage_config().mode == disk::StorageMode::Tiered {
         println!("storage: tiered mode (dir: {})", disk::storage_config().dir);
     }
@@ -148,7 +147,16 @@ async fn main() -> std::io::Result<()> {
             let http_broker = broker.clone();
             let http_cache = schema_cache.clone();
             tokio::spawn(async move {
-                if let Err(e) = http::start_http_server(http_port, http_store, http_broker, http_cache, max_rows, max_body).await {
+                if let Err(e) = http::start_http_server(
+                    http_port,
+                    http_store,
+                    http_broker,
+                    http_cache,
+                    max_rows,
+                    max_body,
+                )
+                .await
+                {
                     eprintln!("http server error: {e}");
                 }
             });
@@ -304,7 +312,7 @@ async fn handle_tx_cmd(
                     let refs: Vec<&[u8]> = owned_args.iter().map(|v| v.as_slice()).collect();
                     let cmd_result = {
                         let _guard = SCRIPT_GATE.read();
-                        cmd::execute_with_wal(store, &schema_cache, broker, &refs, write_buf, now)
+                        cmd::execute_with_wal(store, schema_cache, broker, &refs, write_buf, now)
                     };
                     match cmd_result {
                         CmdResult::Written => {}
@@ -725,7 +733,14 @@ async fn handle_connection(
 
                     let cmd_result = {
                         let _guard = SCRIPT_GATE.read();
-                        cmd::execute_with_wal(&store, &schema_cache, &broker, args, &mut write_buf, now)
+                        cmd::execute_with_wal(
+                            &store,
+                            &schema_cache,
+                            &broker,
+                            args,
+                            &mut write_buf,
+                            now,
+                        )
                     };
                     match cmd_result {
                         CmdResult::Written => {
@@ -917,7 +932,14 @@ async fn handle_connection(
 
                         let cmd_result = {
                             let _guard = SCRIPT_GATE.read();
-                            cmd::execute_with_wal(&store, &schema_cache, &broker, args, &mut write_buf, now)
+                            cmd::execute_with_wal(
+                                &store,
+                                &schema_cache,
+                                &broker,
+                                args,
+                                &mut write_buf,
+                                now,
+                            )
                         };
                         match cmd_result {
                             CmdResult::Written => {
@@ -1134,7 +1156,14 @@ async fn handle_connection(
                             }
                         } else {
                             for args in &commands[i..batch_end] {
-                                cmd::execute_with_wal(&store, &schema_cache, &broker, args, &mut write_buf, now);
+                                cmd::execute_with_wal(
+                                    &store,
+                                    &schema_cache,
+                                    &broker,
+                                    args,
+                                    &mut write_buf,
+                                    now,
+                                );
                                 fire_key_events(&broker, args);
                             }
                         }

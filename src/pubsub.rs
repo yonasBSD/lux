@@ -561,6 +561,9 @@ mod tests {
         );
 
         assert_eq!(rx2.try_recv().unwrap().channel, "table:users");
-        assert_eq!(rx2.try_recv().err(), Some(broadcast::error::TryRecvError::Empty));
+        assert_eq!(
+            rx2.try_recv().err(),
+            Some(broadcast::error::TryRecvError::Empty)
+        );
     }
 }

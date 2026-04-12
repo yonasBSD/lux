@@ -56,17 +56,12 @@ pub enum FieldType {
 }
 
 /// What to do when the referenced row is deleted
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum OnDelete {
+    #[default]
     Restrict, // default - block the delete if references exist
-    Cascade,  // delete referencing rows too
-    SetNull,  // set the FK column to NULL
-}
-
-impl Default for OnDelete {
-    fn default() -> Self {
-        OnDelete::Restrict
-    }
+    Cascade, // delete referencing rows too
+    SetNull, // set the FK column to NULL
 }
 
 /// An explicit foreign key constraint
@@ -1159,14 +1154,14 @@ fn table_update_by_pk_str(
         let field = schema.iter().find(|f| f.name == *fname).unwrap();
 
         if let Some(old_val) = old_map.get(*fname) {
-            remove_from_index(store, table, field, old_val, &pk_str, now);
+            remove_from_index(store, table, field, old_val, pk_str, now);
             if field.unique {
                 let ukey = uniq_key(table, &field.name);
                 let _ = store.hdel(ukey.as_bytes(), &[old_val.as_bytes()], now);
             }
         }
 
-        add_to_index(store, table, field, fval, &pk_str, now);
+        add_to_index(store, table, field, fval, pk_str, now);
         if field.unique {
             let ukey = uniq_key(table, &field.name);
             let _ = store.hset(
@@ -1192,6 +1187,7 @@ fn table_update_by_pk_str(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn table_delete(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -1219,7 +1215,7 @@ fn table_delete_inner(
         ));
     }
     let schema = load_schema(store, cache, table, now)?;
-    let rk = row_key_for_pk(table, &pk_str);
+    let rk = row_key_for_pk(table, pk_str);
 
     let row_map: std::collections::HashMap<String, String> =
         get_row(store, table, &schema, pk_str, now)
@@ -1362,7 +1358,7 @@ fn table_delete_inner(
 
     for field in &schema {
         if let Some(val) = row_map.get(&field.name) {
-            remove_from_index(store, table, field, val, &pk_str, now);
+            remove_from_index(store, table, field, val, pk_str, now);
             if field.unique {
                 let ukey = uniq_key(table, &field.name);
                 let _ = store.hdel(ukey.as_bytes(), &[val.as_bytes()], now);
@@ -1465,7 +1461,7 @@ pub fn table_update_where(
     for (fname, _) in field_values {
         schema
             .iter()
-            .find(|f| &f.name == *fname)
+            .find(|f| f.name == *fname)
             .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
     }
 
@@ -3232,9 +3228,9 @@ mod tests {
     #[test]
     fn encode_decode_float() {
         let ft = FieldType::Float;
-        let encoded = ft.encode_value("3.14").unwrap();
+        let encoded = ft.encode_value(&std::f64::consts::PI.to_string()).unwrap();
         let decoded: f64 = ft.decode_value(&encoded).parse().unwrap();
-        assert!((decoded - 3.14).abs() < 1e-10);
+        assert!((decoded - std::f64::consts::PI).abs() < 1e-10);
     }
 
     #[test]
@@ -3397,7 +3393,7 @@ mod tests {
             &cache,
             "users",
             &[
-                &format!("team_id INT REFERENCES teams(id) ON DELETE RESTRICT,"),
+                "team_id INT REFERENCES teams(id) ON DELETE RESTRICT,",
                 "name STR",
             ],
             now,

@@ -140,10 +140,9 @@ fn http_request_with_headers(
                     if headers
                         .to_lowercase()
                         .contains("transfer-encoding: chunked")
+                        && response.windows(5).any(|w| w == b"0\r\n\r\n")
                     {
-                        if response.windows(5).any(|w| w == b"0\r\n\r\n") {
-                            break;
-                        }
+                        break;
                     }
                 }
             }
