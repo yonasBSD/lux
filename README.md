@@ -71,7 +71,7 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 ## Features
 
 - **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, tables, HyperLogLog, bitops, pub/sub, transactions
-- **Relational tables** -- TCREATE, TINSERT, TQUERY, TALTER with typed fields (str, int, float, bool, timestamp), unique constraints, foreign keys, joins, WHERE/ORDER BY/LIMIT. Structured data without standing up Postgres
+- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid), unique constraints, foreign keys, joins, WHERE/ORDER BY/LIMIT. Structured data without standing up Postgres
 - **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
 - **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering. No extensions, no sidecars
@@ -207,26 +207,31 @@ Built-in relational tables with typed fields, indexes, unique constraints, forei
 
 ```bash
 # Create a table with typed fields
-redis-cli TCREATE users name:str email:str:unique age:int active:bool created_at:timestamp
+redis-cli TCREATE users "id INT PRIMARY KEY," "name STR," "email STR UNIQUE," "age INT," "active BOOL"
 
 # Insert rows (* auto-generates timestamp)
 redis-cli TINSERT users name Alice email alice@example.com age 28 active true created_at *
 redis-cli TINSERT users name Bob email bob@example.com age 35 active false created_at *
 
 # Query with WHERE, ORDER BY, LIMIT
-redis-cli TQUERY users WHERE age > 25 ORDER BY age DESC
+redis-cli TSELECT '*' FROM users WHERE age '>' 25 ORDER BY age DESC LIMIT 10
 
 # Foreign keys and joins
-redis-cli TCREATE posts title:str author:ref(users)
-redis-cli TINSERT posts title "Hello World" author 1
-redis-cli TQUERY posts JOIN author
+redis-cli TCREATE posts "id INT PRIMARY KEY," "title STR," "author_id INT REFERENCES users(id)"
+redis-cli TINSERT posts id 1 title "Hello World" author_id 1
+redis-cli TSELECT '*' FROM posts p JOIN users u ON p.author_id = u.id
+
+# Update and delete by predicates
+redis-cli TUPDATE users SET active true WHERE id = 1
+redis-cli TDELETE FROM users WHERE id = 2
 
 # Alter tables
-redis-cli TALTER users ADD role:str
+redis-cli TALTER users ADD role STR
 redis-cli TALTER users DROP role
 ```
 
-Field types: `str`, `int`, `float`, `bool`, `timestamp`, `ref(table)`. Supports `:unique` constraint.
+Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`.
+Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`.
 
 ### CLI
 
@@ -302,15 +307,15 @@ curl http://localhost:8080/v1/kv/myzset/zset               # ZRANGEBYSCORE
 **Tables:**
 ```bash
 curl -X POST http://localhost:8080/v1/tables \
-  -d '{"name":"users","columns":["name:str","age:int"]}'   # TCREATE
+  -d '{"name":"users","columns":["id INT PRIMARY KEY","name STR","age INT"]}'   # TCREATE
 curl http://localhost:8080/v1/tables                        # TLIST
 curl -X POST http://localhost:8080/v1/tables/users \
   -d '{"name":"Alice","age":"28"}'                          # TINSERT
-curl 'http://localhost:8080/v1/tables/users?where=age>25&order=name&limit=10'  # TQUERY
-curl http://localhost:8080/v1/tables/users/1                # TGET
+curl 'http://localhost:8080/v1/tables/users?where=age>25&order=name&limit=10'  # TSELECT
+curl http://localhost:8080/v1/tables/users/1                # row lookup endpoint
 curl -X PUT http://localhost:8080/v1/tables/users/1 \
-  -d '{"name":"Alicia"}'                                    # TUPDATE
-curl -X DELETE http://localhost:8080/v1/tables/users/1      # TDEL
+  -d '{"name":"Alicia"}'                                    # TUPDATE ... WHERE id = 1
+curl -X DELETE http://localhost:8080/v1/tables/users/1      # TDELETE FROM ... WHERE id = 1
 ```
 
 **Time Series:**
@@ -428,7 +433,7 @@ cargo test
 | **Integration: timeseries** | 18 | TSADD, TSGET, TSRANGE, TSMRANGE, TSMADD, TSINFO, aggregation, retention, labels, filtering |
 | **Integration: ksub** | 6 | KSUB event delivery, pattern filtering, multiple patterns, KUNSUB, HSET/DEL events |
 | **Integration: http** | 14 | HTTP REST API: health, auth, KV CRUD, tables REST, time series REST, vectors REST, data types, exec, CORS, 404 |
-| **Integration: tables** | 14 | TCREATE, TINSERT, TGET, TQUERY, TUPDATE, TDEL, TDROP, TCOUNT, TLIST, TSCHEMA, joins, foreign keys, unique constraints |
+| **Integration: tables** | 14 | TCREATE, TINSERT, TSELECT, TUPDATE, TDELETE, TDROP, TCOUNT, TLIST, TSCHEMA, joins, foreign keys, unique constraints |
 | **Valkey compat** | 10+ | Valkey multi.tcl test suite run against Lux |
 
 Run the benchmark against Redis:
@@ -476,7 +481,7 @@ Release and Docker builds only proceed after tests pass.
 
 **Vectors:** `VSET` `VGET` `VSEARCH` `VCARD`
 
-**Tables:** `TCREATE` `TINSERT` `TGET` `TQUERY` `TUPDATE` `TDEL` `TDROP` `TCOUNT` `TSCHEMA` `TLIST` `TALTER`
+**Tables:** `TCREATE` `TINSERT` `TSELECT` `TUPDATE` `TDELETE` `TDROP` `TCOUNT` `TSCHEMA` `TLIST` `TALTER`
 
 **Scripting:** `EVAL` `EVALSHA` `SCRIPT LOAD` `SCRIPT EXISTS` `SCRIPT FLUSH`
 

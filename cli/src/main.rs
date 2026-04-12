@@ -1238,8 +1238,9 @@ impl DirectConn {
         resp_read_response(&mut self.reader)
     }
 
-    /// Execute TQUERY and return rows as Vec<Vec<String>> (each row is [id, field, val, ...])
-    fn exec_tquery(&mut self, command: &str) -> Result<Vec<Vec<String>>, String> {
+    /// Execute a table select command and return rows as Vec<Vec<String>>
+    /// (each row is [field, value, field, value, ...]).
+    fn exec_table_rows(&mut self, command: &str) -> Result<Vec<Vec<String>>, String> {
         let parts: Vec<&str> = command.split_whitespace().collect();
         self.stream
             .write_all(&resp_encode(&parts))
@@ -1387,7 +1388,7 @@ async fn ensure_migrations_table(target: &mut MigrateTarget) {
     let needs_create = target.exec("TSCHEMA __migrations").await.is_err();
     if needs_create {
         if let Err(e) = target
-            .exec("TCREATE __migrations filename:str checksum:str applied_at:int")
+            .exec("TCREATE __migrations filename TEXT, checksum TEXT, applied_at INT")
             .await
         {
             eprintln!(
@@ -1405,8 +1406,8 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> std::collections:
 
     match target {
         MigrateTarget::Direct(conn) => {
-            if let Ok(rows) = conn.exec_tquery("TQUERY __migrations ORDER BY id ASC LIMIT 1000") {
-                // Each row: [id, "filename", value, "checksum", value, "applied_at", value]
+            if let Ok(rows) = conn.exec_table_rows("TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000") {
+                // Each row: ["field", value, "field", value, ...]
                 for row in &rows {
                     for i in 0..row.len().saturating_sub(1) {
                         if row[i] == "filename" {
@@ -1430,11 +1431,11 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> std::collections:
                 api_url,
                 token,
                 instance_id,
-                "TQUERY __migrations ORDER BY id ASC LIMIT 1000",
+                "TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000",
             )
             .await
             {
-                // API returns [[id, "field", "val", ...], ...]
+                // API returns [["field", "val", ...], ...]
                 if let Some(rows) = body.as_array() {
                     for row in rows {
                         if let Some(fields) = row.as_array() {
