@@ -1,179 +1,39 @@
 import Redis, { type RedisOptions } from 'ioredis';
+import { TimeSeriesNamespace, VectorNamespace } from './namespaces';
+import { LuxRealtimeManager } from './realtime';
+import { TableQueryBuilder, type TableQueryBuilderOptions } from './table';
+import type {
+	KSubEvent,
+	TableRow,
+	TSAddOptions,
+	TSMRangeResult,
+	TSRangeOptions,
+	TSSample,
+	VSearchResult,
+} from './types';
 
-export interface VSearchResult {
-	key: string;
-	similarity: number;
-	metadata?: Record<string, unknown>;
-}
-
-export interface TSSample {
-	timestamp: number;
-	value: number;
-}
-
-export interface TSAddOptions {
-	retention?: number;
-	labels?: Record<string, string>;
-}
-
-export interface TSRangeOptions {
-	aggregation?: {
-		type: 'avg' | 'sum' | 'min' | 'max' | 'count' | 'first' | 'last' | 'range' | 'std.p' | 'std.s' | 'var.p' | 'var.s';
-		bucketSize: number;
-	};
-}
-
-export interface TSMRangeResult {
-	key: string;
-	labels: Record<string, string>;
-	samples: TSSample[];
-}
-
-export interface KSubEvent {
-	pattern: string;
-	key: string;
-	operation: string;
-}
-
-export interface TableRow {
-	id: number;
-	[field: string]: unknown;
-}
-
-class TableQueryBuilder {
-	private client: Lux;
-	private name: string;
-	private conditions: string[] = [];
-	private orderField?: string;
-	private orderDir?: 'ASC' | 'DESC';
-	private limitCount?: number;
-	private joinTable?: string;
-
-	constructor(client: Lux, name: string) {
-		this.client = client;
-		this.name = name;
-	}
-
-	where(field: string, op: '=' | '!=' | '>' | '<' | '>=' | '<=', value: string | number | boolean): this {
-		const v = typeof value === 'string' ? `'${value}'` : String(value);
-		this.conditions.push(`${field} ${op} ${v}`);
-		return this;
-	}
-
-	orderBy(field: string, dir: 'asc' | 'desc' = 'asc'): this {
-		this.orderField = field;
-		this.orderDir = dir.toUpperCase() as 'ASC' | 'DESC';
-		return this;
-	}
-
-	limit(n: number): this {
-		this.limitCount = n;
-		return this;
-	}
-
-	join(table: string): this {
-		this.joinTable = table;
-		return this;
-	}
-
-	async run(): Promise<TableRow[]> {
-		const args: string[] = [this.name];
-		if (this.conditions.length) {
-			args.push('WHERE', this.conditions.join(' AND '));
-		}
-		if (this.orderField) {
-			args.push('ORDER', 'BY', this.orderField, this.orderDir || 'ASC');
-		}
-		if (this.limitCount != null) {
-			args.push('LIMIT', String(this.limitCount));
-		}
-		if (this.joinTable) {
-			args.push('JOIN', this.joinTable);
-		}
-		return this.client._tquery(args);
-	}
-
-	async insert(data: Record<string, unknown>): Promise<number> {
-		const args: (string | number)[] = [this.name];
-		for (const [k, v] of Object.entries(data)) {
-			args.push(k, String(v));
-		}
-		const result = await this.client.call('TINSERT', ...args) as string;
-		return parseInt(result, 10) || 0;
-	}
-
-	async update(id: number, data: Record<string, unknown>): Promise<string> {
-		const args: (string | number)[] = [this.name, id];
-		for (const [k, v] of Object.entries(data)) {
-			args.push(k, String(v));
-		}
-		return this.client.call('TUPDATE', ...args) as Promise<string>;
-	}
-
-	async delete(...ids: number[]): Promise<number> {
-		return this.client.call('TDEL', this.name, ...ids) as Promise<number>;
-	}
-}
-
-class VectorNamespace {
-	private client: Lux;
-
-	constructor(client: Lux) {
-		this.client = client;
-	}
-
-	async set(key: string, vector: number[], metadata?: Record<string, unknown>): Promise<string> {
-		const args: (string | number)[] = [key, vector.length, ...vector];
-		if (metadata) {
-			args.push('META', JSON.stringify(metadata));
-		}
-		return this.client.call('VSET', ...args) as Promise<string>;
-	}
-
-	async get(key: string): Promise<{ dims: number; vector: number[]; metadata?: Record<string, unknown> } | null> {
-		return this.client.vget(key);
-	}
-
-	async search(query: number[], options: { topK: number; filter?: { key: string; value: string }; meta?: boolean }): Promise<VSearchResult[]> {
-		return this.client.vsearch(query, { k: options.topK, filter: options.filter, meta: options.meta ?? true });
-	}
-
-	async count(): Promise<number> {
-		return this.client.vcard();
-	}
-}
-
-class TimeSeriesNamespace {
-	private client: Lux;
-
-	constructor(client: Lux) {
-		this.client = client;
-	}
-
-	async add(key: string, value: number, options?: { timestamp?: number | '*'; retention?: number; labels?: Record<string, string> }): Promise<number> {
-		return this.client.tsadd(key, options?.timestamp ?? '*', value, { retention: options?.retention, labels: options?.labels });
-	}
-
-	async get(key: string): Promise<TSSample | null> {
-		return this.client.tsget(key);
-	}
-
-	async range(key: string, from: number | '-', to: number | '+', options?: TSRangeOptions): Promise<TSSample[]> {
-		return this.client.tsrange(key, from, to, options);
-	}
-
-	async mrange(from: number | '-', to: number | '+', filter: string, options?: TSRangeOptions): Promise<TSMRangeResult[]> {
-		return this.client.tsmrange(from, to, filter, options);
-	}
-
-	async info(key: string): Promise<Record<string, unknown>> {
-		return this.client.tsinfo(key);
-	}
-}
+export type {
+	KSubEvent,
+	LuxError,
+	LuxResult,
+	TableChangeEvent,
+	TableChangeType,
+	TableErrorEvent,
+	TableRow,
+	TableSchema,
+	TSAddOptions,
+	TSMRangeResult,
+	TSRangeOptions,
+	TSSample,
+	VSearchResult,
+} from './types';
+export { TableQueryBuilder, TableSubscription } from './table';
+export type { TableQueryBuilderOptions } from './table';
 
 export class Lux extends Redis {
 	vectors: VectorNamespace;
 	timeseries: TimeSeriesNamespace;
+	private realtimeManager?: LuxRealtimeManager;
 
 	constructor(options?: RedisOptions | string) {
 		if (typeof options === 'string') {
@@ -187,22 +47,35 @@ export class Lux extends Redis {
 		this.timeseries = new TimeSeriesNamespace(this);
 	}
 
-	table(name: string): TableQueryBuilder {
-		return new TableQueryBuilder(this, name);
+	table<T extends TableRow = TableRow>(name: string, options?: TableQueryBuilderOptions<T>): TableQueryBuilder<T> {
+		return new TableQueryBuilder<T>(this, name, options);
 	}
 
-	async _tquery(args: string[]): Promise<TableRow[]> {
-		const result = await this.call('TQUERY', ...args) as any;
+	async _subscribePattern(pattern: string, handler: (event: KSubEvent) => void): Promise<() => void> {
+		if (!this.realtimeManager) {
+			this.realtimeManager = new LuxRealtimeManager(this);
+		}
+		return this.realtimeManager.subscribe(pattern, handler);
+	}
+
+	async _tselect(args: string[]): Promise<TableRow[]> {
+		const result = await this.call('TSELECT', ...args) as any;
 		if (!result || !Array.isArray(result)) return [];
 
 		const rows: TableRow[] = [];
 		for (const item of result) {
-			if (Array.isArray(item) && item.length >= 1) {
-				const row: TableRow = { id: parseInt(item[0], 10) };
-				for (let i = 1; i < item.length - 1; i += 2) {
+			if (Array.isArray(item)) {
+				const row: TableRow = {};
+				for (let i = 0; i < item.length - 1; i += 2) {
 					const key = String(item[i]);
 					const val = item[i + 1];
 					row[key] = val;
+				}
+				if (row.id != null) {
+					const parsed = Number(row.id);
+					if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
+						row.id = parsed;
+					}
 				}
 				rows.push(row);
 			}
@@ -383,6 +256,10 @@ export class Lux extends Redis {
 			unsubscribe() { sub.disconnect(); },
 		};
 	}
+}
+
+export function createClient(options?: RedisOptions | string): Lux {
+	return new Lux(options);
 }
 
 export default Lux;
